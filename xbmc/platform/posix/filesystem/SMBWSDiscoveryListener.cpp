@@ -20,6 +20,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cerrno>
 #include <mutex>
 #include <stdio.h>
 #include <string>
@@ -331,22 +332,36 @@ bool CWSDiscoveryListenerUDP::DispatchCommand()
     m_commandbuffer.erase(it);
   }
 
-  int ret;
-
   // As its udp, send multiple messages due to unreliability
   // Windows seems to send 4-6 times for reference
+  bool sent = false;
   for (int i = 0; i < retries; i++)
   {
-    do
+    const int ret = sendto(fd, sendCommand.commandMsg.c_str(), sendCommand.commandMsg.size(), 0,
+                           (struct sockaddr*)&sendCommand.address, sizeof(sendCommand.address));
+    if (ret == -1)
     {
-      ret = sendto(fd, sendCommand.commandMsg.c_str(), sendCommand.commandMsg.size(), 0,
-                   (struct sockaddr*)&sendCommand.address, sizeof(sendCommand.address));
-    } while (ret == -1 && !m_bStop);
-    std::chrono::seconds sec(1);
-    CThread::Sleep(sec);
+      const int error = errno;
+      // A denied multicast send (e.g. iOS EPERM) cannot succeed by spinning.
+      // Drop permanent failures; transient failures share the bounded retry
+      // budget and the same interruptible delay as successful UDP repeats.
+      if (error != EINTR && error != EAGAIN && error != EWOULDBLOCK && error != ENOBUFS)
+      {
+        CLog::Log(LOGWARNING, "WS-Discovery UDP send failed (errno {}); dropping command", error);
+        return true;
+      }
+    }
+    else
+      sent = true;
+    if (m_bStop || i + 1 == retries)
+      break;
+    CThread::Sleep(std::chrono::seconds(1));
+    if (m_bStop)
+      break;
   }
 
-  CLog::Log(LOGDEBUG, LOGWSDISCOVERY, "CWSDiscoveryListenerUDP::DispatchCommand - Command sent");
+  CLog::Log(LOGDEBUG, LOGWSDISCOVERY, "CWSDiscoveryListenerUDP::DispatchCommand - {}",
+            sent ? "Command sent" : "Send attempts exhausted or interrupted");
 
   return true;
 }
