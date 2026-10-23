@@ -41,6 +41,12 @@
   }
 }
 
+- (void)windowScene:(UIWindowScene*)windowScene
+    didUpdateEffectiveGeometry:(UIWindowSceneGeometry*)previousGeometry
+{
+  [g_xbmcController.view setNeedsLayout];
+}
+
 - (void)sceneWillResignActive:(UIScene*)scene
 {
   [g_xbmcController pauseAnimation];

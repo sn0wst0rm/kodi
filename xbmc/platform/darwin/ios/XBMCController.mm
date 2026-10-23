@@ -118,6 +118,7 @@ public:
 {
   std::unique_ptr<DebugLogSharingPresenter> m_debugLogSharingPresenter;
   UIStackView* m_foldControls;
+  BOOL m_hasActiveFold;
 }
 - (void)rescheduleNetworkAutoSuspend;
 @end
@@ -196,11 +197,12 @@ public:
 
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations
 {
-  return UIInterfaceOrientationMaskLandscape;
+  // Tabletop needs a tall scene containing a landscape canvas above controls.
+  return m_hasActiveFold ? UIInterfaceOrientationMaskAll : UIInterfaceOrientationMaskLandscape;
 }
 - (BOOL)prefersInterfaceOrientationLocked
 {
-  return YES;
+  return NO;
 }
 
 - (BOOL)prefersStatusBarHidden
@@ -665,12 +667,14 @@ public:
     return;
   CGRect drawable = self.view.bounds;
   CGRect controls = CGRectZero;
+  BOOL hasActiveFold = NO;
   if (@available(iOS 27.1, *))
   {
     // Query the actual fold geometry; no device model or hinge-angle guesses.
     for (UIViewReservedRegion* region in
          [self.view reservedRegionsOfKind:[UIViewReservedRegionKind divisionRegionKind]])
     {
+      hasActiveFold |= region.isActive;
       CGRect fold = CGRectIntersection(region.frame, self.view.bounds);
       if (region.isActive && !CGRectIsNull(fold) &&
           fold.size.width > fold.size.height && CGRectGetMinY(fold) > 0 &&
@@ -682,6 +686,12 @@ public:
         break;
       }
     }
+  }
+  if (m_hasActiveFold != hasActiveFold)
+  {
+    m_hasActiveFold = hasActiveFold;
+    if (@available(iOS 16.0, *))
+      [self setNeedsUpdateOfSupportedInterfaceOrientations];
   }
   m_foldControls.hidden = CGRectIsEmpty(controls);
   if (!m_foldControls.hidden)
@@ -753,7 +763,7 @@ public:
   {
     [self setNeedsUpdateOfSupportedInterfaceOrientations];
     UIWindowSceneGeometryPreferencesIOS* preferences =
-        [[UIWindowSceneGeometryPreferencesIOS alloc] initWithInterfaceOrientations:UIInterfaceOrientationMaskLandscape];
+        [[UIWindowSceneGeometryPreferencesIOS alloc] initWithInterfaceOrientations:self.supportedInterfaceOrientations];
     [self.view.window.windowScene requestGeometryUpdateWithPreferences:preferences errorHandler:^(NSError* error) {
       NSLog(@"Kodi landscape preference: %@", error.localizedDescription);
     }];
@@ -837,7 +847,16 @@ public:
     return;
   }
 
-  // apply safe area to Kodi GUI
+  // Kodi renders an immersive canvas, including its background. Applying scene
+  // safe-area insets here shrinks that entire canvas and leaves a black strip
+  // on the Duo outer display. UIKit fold controls retain their own safe area.
+  if (@available(iOS 27.1, *))
+  {
+    guiInsets = EdgeInsets{};
+    return;
+  }
+
+  // apply safe area to Kodi GUI on older systems
   UIEdgeInsets __block insets;
   CGFloat __block scale;
   auto getInsets = ^{
