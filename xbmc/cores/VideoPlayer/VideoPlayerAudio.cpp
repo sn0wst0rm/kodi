@@ -585,6 +585,15 @@ bool CVideoPlayerAudio::ProcessDecoderOutput(DVDAudioFrame &audioframe)
 
 void CVideoPlayerAudio::SetSyncType(bool passthrough)
 {
+#if defined(TARGET_DARWIN_IOS)
+  // Enable AudioEngine's pitch-preserving tempo processing only when needed.
+  // Plain 1x playback retains the original inexpensive clock-feedback path.
+  const bool tempo = m_speed > 0 && m_speed != DVD_PLAYSPEED_NORMAL &&
+      m_processInfo.IsTempoAllowed(static_cast<float>(m_speed) / DVD_PLAYSPEED_NORMAL);
+  m_synctype = tempo || m_processInfo.IsRealtimeStream() ||
+      CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(
+          CSettings::SETTING_VIDEOPLAYER_USEDISPLAYASCLOCK) ? SYNC_RESAMPLE : SYNC_DISCON;
+#endif
   if (passthrough && m_synctype == SYNC_RESAMPLE)
     m_synctype = SYNC_DISCON;
 

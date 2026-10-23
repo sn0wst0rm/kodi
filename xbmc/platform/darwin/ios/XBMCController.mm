@@ -10,11 +10,14 @@
 
 #include "CompileInfo.h"
 #include "FileItem.h"
+#include "GUIInfoManager.h"
 #include "ServiceBroker.h"
 #include "Util.h"
 #include "application/AppInboundProtocol.h"
 #include "application/ApplicationComponents.h"
+#include "application/Application.h"
 #include "application/ApplicationPlayer.h"
+#include "cores/VideoPlayer/Interface/StreamInfo.h"
 #include "cores/DataCacheCore.h"
 #include "cores/AudioEngine/Interfaces/AE.h"
 #include "filesystem/SpecialProtocol.h"
@@ -60,6 +63,7 @@
 #include <algorithm>
 #include <mutex>
 #include <atomic>
+#include <functional>
 #include <signal.h>
 
 #import <AVFoundation/AVAudioSession.h>
@@ -190,6 +194,34 @@ static void ToggleFoldWindow(int windowId)
   CServiceBroker::GetAppMessenger()->PostMsg(TMSG_CALLBACK, -1, -1, &request->message);
 }
 
+// Player/GUI queries run on Kodi's thread. UIKit never waits for its locks.
+static void PostFoldTask(std::function<void()> task)
+{
+  struct Request
+  {
+    KODI::MESSAGING::ThreadMessageCallback message;
+    std::function<void()> task;
+  };
+  auto* request = new Request;
+  request->task = std::move(task);
+  request->message.userptr = request;
+  request->message.callback = [](void* context) {
+    std::unique_ptr<Request> request(static_cast<Request*>(context));
+    request->task();
+  };
+  CServiceBroker::GetAppMessenger()->PostMsg(TMSG_CALLBACK, -1, -1, &request->message);
+}
+
+struct FoldPlaybackSettings
+{
+  std::string path;
+  bool playing{false};
+  bool canTempo{false};
+  float tempo{1};
+  int selected{-1};
+  std::vector<VideoStreamInfo> streams;
+};
+
 class DebugLogSharingPresenter : ISettingCallback
 {
 public:
@@ -247,6 +279,12 @@ public:
 {
   std::unique_ptr<DebugLogSharingPresenter> m_debugLogSharingPresenter;
   UIStackView* m_foldControls;
+  NSArray<UIView*>* m_foldMainRows;
+  UIStackView* m_foldSettingsPanel;
+  NSInteger m_foldSettingsPage; // 0 controls, 1 settings, 2 quality, 3 speed
+  BOOL m_foldSettingsPending;
+  std::shared_ptr<FoldPlaybackSettings> m_foldSettingsState;
+  NSString* m_foldSettingsSignature;
   UISlider* m_foldScrubber;
   UILabel* m_foldElapsed;
   UIButton* m_foldDuration;
@@ -287,6 +325,9 @@ public:
 - (void)rescheduleNetworkAutoSuspend;
 - (void)updateFoldPlaybackState;
 - (void)updateFoldTimer;
+- (void)refreshFoldSettings;
+- (void)renderFoldSettings;
+- (void)applyHDRPreference;
 - (void)displayHDRFrame:(const std::shared_ptr<IOSHDRFrame>&)frame;
 - (void)layoutHDRVideo;
 - (void)resetHDRVideo;
@@ -495,10 +536,7 @@ void ScheduleHDRDelivery()
       [m_glView.superview insertSubview:m_hdrCanvas belowSubview:m_glView];
       m_hdrLayer = [[AVSampleBufferDisplayLayer alloc] init];
       m_hdrLayer.videoGravity = AVLayerVideoGravityResize;
-      if (@available(iOS 26.0, *))
-        m_hdrLayer.preferredDynamicRange = CADynamicRangeHigh;
-      else
-        m_hdrLayer.wantsExtendedDynamicRangeContent = YES;
+      [self applyHDRPreference];
       [m_hdrCrop.layer addSublayer:m_hdrLayer];
       CMTimebaseCreateWithSourceClock(kCFAllocatorDefault, CMClockGetHostTimeClock(), &m_pipTimebase);
       m_hdrLayer.controlTimebase = m_pipTimebase;
@@ -1186,8 +1224,8 @@ void ScheduleHDRDelivery()
   ]];
   settings.showsMenuAsPrimaryAction = NO;
   settings.tag = WINDOW_DIALOG_VIDEO_OSD_SETTINGS;
-  settings.accessibilityHint = @"Tocca per le impostazioni video; tieni premuto per le impostazioni Kodi";
-  [settings addTarget:self action:@selector(foldUtilityPressed:)
+  settings.accessibilityHint = @"Qualità, HDR e velocità; tieni premuto per le impostazioni Kodi";
+  [settings addTarget:self action:@selector(foldSettingsPressed:)
       forControlEvents:UIControlEventTouchUpInside];
   [utilities addArrangedSubview:settings];
   NSArray<NSString*>* utilitySymbols = @[@"captions.bubble", @"info.circle", @"globe"];
@@ -1215,6 +1253,16 @@ void ScheduleHDRDelivery()
   [m_foldPiP addTarget:self action:@selector(togglePictureInPicture:) forControlEvents:UIControlEventTouchUpInside];
   [navigation addArrangedSubview:m_foldPiP];
   [m_foldControls addArrangedSubview:navigation];
+  m_foldMainRows = @[transport, utilities, navigation];
+  m_foldSettingsPanel = [[UIStackView alloc] init];
+  m_foldSettingsPanel.axis = UILayoutConstraintAxisVertical;
+  m_foldSettingsPanel.spacing = 8;
+  m_foldSettingsPanel.hidden = YES;
+  // Match the three control rows so opening a submenu does not move the video.
+  NSLayoutConstraint* panelHeight = [m_foldSettingsPanel.heightAnchor constraintEqualToConstant:236];
+  panelHeight.priority = 999; // UIStackView collapses hidden arranged views to zero.
+  panelHeight.active = YES;
+  [m_foldControls addArrangedSubview:m_foldSettingsPanel];
   m_foldPlaybackButtons = playbackButtons;
   m_foldControls.hidden = YES;
   [self.view addSubview:m_foldControls];
@@ -1239,8 +1287,264 @@ void ScheduleHDRDelivery()
   };
   button.configuration = configuration;
   button.accessibilityLabel = title;
-  [button.heightAnchor constraintEqualToConstant:68].active = YES;
+  NSLayoutConstraint* height = [button.heightAnchor constraintEqualToConstant:68];
+  height.priority = 999;
+  height.active = YES;
   return button;
+}
+
+- (BOOL)foldHDREnabled
+{
+  NSNumber* saved = [NSUserDefaults.standardUserDefaults objectForKey:@"DuoHDREnabled"];
+  return saved ? saved.boolValue : YES;
+}
+
+- (BOOL)foldSourceIsHDR
+{
+  return m_hdrDisplayedFrame && IOSIsTenBitVideo(m_hdrDisplayedFrame->buffer) &&
+      (m_hdrDisplayedFrame->metadata.transfer == 16 || m_hdrDisplayedFrame->metadata.transfer == 18);
+}
+
+- (void)applyHDRPreference
+{
+  const BOOL enabled = [self foldHDREnabled];
+  if (@available(iOS 26.0, *))
+    m_hdrLayer.preferredDynamicRange = enabled ? CADynamicRangeHigh : CADynamicRangeStandard;
+  else
+    m_hdrLayer.wantsExtendedDynamicRangeContent = enabled;
+}
+
+- (void)foldHDRChanged:(UISwitch*)sender
+{
+  if (![self foldSourceIsHDR])
+    return;
+  [NSUserDefaults.standardUserDefaults setBool:sender.on forKey:@"DuoHDREnabled"];
+  [self applyHDRPreference];
+  [self renderFoldSettings];
+}
+
+- (void)setFoldSettingsPage:(NSInteger)page
+{
+  const BOOL wasOpen = m_foldSettingsPage != 0;
+  m_foldSettingsPage = page;
+  m_foldSettingsSignature = nil;
+  for (UIView* row in m_foldMainRows)
+    row.hidden = page != 0;
+  m_foldSettingsPanel.hidden = page == 0;
+  if (wasOpen != (page != 0))
+    PostFoldTask([show = page != 0] {
+      const auto player = CServiceBroker::GetAppComponents().GetComponent<CApplicationPlayer>();
+      if (player && player->IsPlayingVideo() && CServiceBroker::GetGUI())
+        CServiceBroker::GetGUI()->GetInfoManager().GetInfoProviders().GetPlayerInfoProvider().SetShowInfo(show);
+    });
+  [self renderFoldSettings];
+  if (page)
+    [self refreshFoldSettings];
+  [self.view setNeedsLayout];
+}
+
+- (void)foldSettingsPressed:(UIButton*)sender
+{
+  if (m_glView.isXBMCAlive)
+    [self setFoldSettingsPage:m_foldSettingsPage ? 0 : 1];
+}
+
+- (void)refreshFoldSettings
+{
+  if (m_foldSettingsPending || !m_foldSettingsPage || !m_glView.isXBMCAlive)
+    return;
+  m_foldSettingsPending = YES;
+  __weak XBMCController* weakSelf = self;
+  PostFoldTask([weakSelf] {
+    auto state = std::make_shared<FoldPlaybackSettings>();
+    const auto player = CServiceBroker::GetAppComponents().GetComponent<CApplicationPlayer>();
+    state->playing = player && player->IsPlayingVideo();
+    if (state->playing)
+    {
+      state->path = g_application.CurrentFileItem().GetPath();
+      state->canTempo = player->SupportsTempo() && !player->IsPassthrough();
+      state->tempo = player->GetPlayTempo();
+      state->selected = player->GetVideoStream();
+      for (int i = 0, count = player->GetVideoStreamCount(); i < count; ++i)
+      {
+        VideoStreamInfo info;
+        player->GetVideoStreamInfo(i, info);
+        state->streams.push_back(std::move(info));
+      }
+    }
+    dispatch_async(dispatch_get_main_queue(), ^{
+      XBMCController* controller = weakSelf;
+      if (!controller) return;
+      controller->m_foldSettingsPending = NO;
+      controller->m_foldSettingsState = state;
+      [controller renderFoldSettings];
+    });
+  });
+}
+
+- (NSString*)foldQualityTitle:(const VideoStreamInfo&)stream details:(BOOL)details
+{
+  NSString* resolution = stream.height > 0 ? [NSString stringWithFormat:@"%dp", stream.height] : @"Video";
+  if (stream.name == "Auto")
+    return [NSString stringWithFormat:@"Auto (%@)", resolution];
+  NSMutableString* text = [resolution mutableCopy];
+  if (details && !stream.codecName.empty())
+    [text appendFormat:@" · %@", @(stream.codecName.c_str())];
+  if (stream.hdrType != StreamHdrType::HDR_TYPE_NONE)
+    [text appendString:@" · HDR"];
+  if (details && stream.bitrate > 0)
+    [text appendFormat:@" · %.1f Mb/s", stream.bitrate / 1000000.0];
+  return text;
+}
+
+- (UIButton*)foldSettingRow:(NSString*)title symbol:(NSString*)symbol action:(void (^)(void))action
+{
+  UIButton* button = [UIButton buttonWithType:UIButtonTypeSystem];
+  UIButtonConfiguration* config = [UIButtonConfiguration tintedButtonConfiguration];
+  config.title = title;
+  config.image = [UIImage systemImageNamed:symbol];
+  config.imagePadding = 12;
+  config.baseForegroundColor = UIColor.whiteColor;
+  config.baseBackgroundColor = [UIColor colorWithRed:0.05 green:0.4 blue:0.65 alpha:1];
+  config.contentInsets = NSDirectionalEdgeInsetsMake(8, 16, 8, 16);
+  button.configuration = config;
+  button.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeading;
+  [button.heightAnchor constraintEqualToConstant:53].active = YES;
+  if (action)
+    [button addAction:[UIAction actionWithHandler:^(__kindof UIAction* ignored) { action(); }]
+        forControlEvents:UIControlEventTouchUpInside];
+  return button;
+}
+
+- (void)renderFoldSettings
+{
+  if (!m_foldSettingsPage) return;
+  const auto state = m_foldSettingsState;
+  const BOOL playing = state && state->playing;
+  const BOOL hdr = playing && [self foldSourceIsHDR];
+  // Avoid rebuilding controls under a finger on every timer tick.
+  NSMutableString* signature = [NSMutableString stringWithFormat:@"%ld:%d:%d:%d:%d:%g:%d",
+      (long)m_foldSettingsPage, playing, hdr, [self foldHDREnabled], state && state->canTempo,
+      state ? state->tempo : 1, state ? state->selected : -1];
+  if (state)
+  {
+    [signature appendString:@(state->path.c_str())];
+    for (const auto& stream : state->streams)
+      [signature appendFormat:@"|%@:%d:%d:%d:%@", @(stream.name.c_str()), stream.width,
+          stream.height, stream.bitrate, @(stream.codecName.c_str())];
+  }
+  if ([signature isEqualToString:m_foldSettingsSignature]) return;
+  m_foldSettingsSignature = signature;
+  for (UIView* view in m_foldSettingsPanel.arrangedSubviews)
+  {
+    [m_foldSettingsPanel removeArrangedSubview:view];
+    [view removeFromSuperview];
+  }
+  __weak XBMCController* weakSelf = self;
+  if (m_foldSettingsPage == 1)
+  {
+    NSString* quality = playing ? @"Qualità originale" : @"Nessun video";
+    if (playing && state->selected >= 0 && state->selected < state->streams.size())
+      quality = [self foldQualityTitle:state->streams[state->selected] details:NO];
+    UIButton* qualityButton = [self foldSettingRow:[@"Qualità · " stringByAppendingString:quality]
+        symbol:@"tv" action:^{ [weakSelf setFoldSettingsPage:2]; }];
+    qualityButton.enabled = playing && state->streams.size() > 1;
+    qualityButton.accessibilityHint = qualityButton.enabled ? @"Scegli Auto o una risoluzione" : @"La sorgente espone una sola qualità";
+    [m_foldSettingsPanel addArrangedSubview:qualityButton];
+
+    UIStackView* hdrRow = [[UIStackView alloc] init];
+    hdrRow.layoutMargins = UIEdgeInsetsMake(0, 16, 0, 16);
+    hdrRow.layoutMarginsRelativeArrangement = YES;
+    hdrRow.alignment = UIStackViewAlignmentCenter;
+    hdrRow.spacing = 12;
+    UILabel* label = [[UILabel alloc] init];
+    label.text = hdr ? @"HDR" : @"HDR · non disponibile";
+    label.textColor = hdr ? UIColor.whiteColor : UIColor.grayColor;
+    UISwitch* toggle = [[UISwitch alloc] init];
+    toggle.on = hdr && [self foldHDREnabled];
+    toggle.enabled = hdr;
+    toggle.accessibilityLabel = @"HDR";
+    toggle.accessibilityHint = @"Disattiva per visualizzare il video in SDR";
+    [toggle addTarget:self action:@selector(foldHDRChanged:) forControlEvents:UIControlEventValueChanged];
+    [hdrRow addArrangedSubview:label];
+    [hdrRow addArrangedSubview:toggle];
+    [hdrRow.heightAnchor constraintEqualToConstant:53].active = YES;
+    [m_foldSettingsPanel addArrangedSubview:hdrRow];
+
+    NSString* speed = playing ? [NSString stringWithFormat:@"Velocità · %g×%@", state->tempo,
+        state->canTempo ? @"" : @" · non disponibile"] : @"Velocità · nessun video";
+    UIButton* speedButton = [self foldSettingRow:speed symbol:@"speedometer"
+        action:^{ [weakSelf setFoldSettingsPage:3]; }];
+    speedButton.enabled = playing && state->canTempo;
+    [m_foldSettingsPanel addArrangedSubview:speedButton];
+  }
+  else
+  {
+    UIScrollView* scroll = [[UIScrollView alloc] init];
+    UIStackView* options = [[UIStackView alloc] init];
+    options.axis = UILayoutConstraintAxisVertical;
+    options.spacing = 8;
+    options.translatesAutoresizingMaskIntoConstraints = NO;
+    [scroll addSubview:options];
+    [NSLayoutConstraint activateConstraints:@[
+      [options.leadingAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.leadingAnchor],
+      [options.trailingAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.trailingAnchor],
+      [options.topAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.topAnchor],
+      [options.bottomAnchor constraintEqualToAnchor:scroll.contentLayoutGuide.bottomAnchor],
+      [options.widthAnchor constraintEqualToAnchor:scroll.frameLayoutGuide.widthAnchor]]];
+    if (playing && m_foldSettingsPage == 2)
+    {
+      for (int index = 0; index < state->streams.size(); ++index)
+      {
+        UIButton* option = [self foldSettingRow:[self foldQualityTitle:state->streams[index] details:YES]
+            symbol:index == state->selected ? @"checkmark.circle.fill" : @"circle"
+            action:^{
+              PostFoldTask([state, index] {
+                const auto player = CServiceBroker::GetAppComponents().GetComponent<CApplicationPlayer>();
+                if (player && player->IsPlayingVideo() &&
+                    g_application.CurrentFileItem().GetPath() == state->path &&
+                    player->GetVideoStreamCount() == state->streams.size())
+                {
+                  VideoStreamInfo current;
+                  player->GetVideoStreamInfo(index, current);
+                  const auto& expected = state->streams[index];
+                  if (current.name == expected.name && current.codecName == expected.codecName &&
+                      (current.name == "Auto" || (current.width == expected.width && current.height == expected.height)))
+                    player->SetVideoStream(index);
+                }
+              });
+              [weakSelf setFoldSettingsPage:1];
+            }];
+        [options addArrangedSubview:option];
+      }
+    }
+    else if (playing && m_foldSettingsPage == 3)
+    {
+      for (const float tempo : {0.5f, 0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f})
+      {
+        NSString* title = [NSString stringWithFormat:@"%g×%@", tempo, tempo == 1 ? @" · Normale" : @""];
+        UIButton* option = [self foldSettingRow:title
+            symbol:fabs(state->tempo - tempo) < 0.01 ? @"checkmark.circle.fill" : @"circle"
+            action:^{
+              PostFoldTask([state, tempo] {
+                const auto player = CServiceBroker::GetAppComponents().GetComponent<CApplicationPlayer>();
+                if (player && player->IsPlayingVideo() && player->SupportsTempo() &&
+                    !player->IsPassthrough() && g_application.CurrentFileItem().GetPath() == state->path)
+                  player->SetTempo(tempo);
+              });
+              [weakSelf setFoldSettingsPage:1];
+            }];
+        option.enabled = state->canTempo;
+        [options addArrangedSubview:option];
+      }
+    }
+    [m_foldSettingsPanel addArrangedSubview:scroll];
+  }
+  NSInteger destination = m_foldSettingsPage == 1 ? 0 : 1;
+  [m_foldSettingsPanel addArrangedSubview:[self foldSettingRow:
+      destination ? @"Impostazioni" : @"Torna ai controlli" symbol:@"chevron.backward"
+      action:^{ [weakSelf setFoldSettingsPage:destination]; }]];
+  [self.view setNeedsLayout];
 }
 
 - (void)openFoldWindow:(int)window
@@ -1260,7 +1564,7 @@ void ScheduleHDRDelivery()
   CServiceBroker::GetDataCacheCore().GetPlayTimes(start, current, minimum, maximum);
   if (m_pipTimebase)
   {
-    const double rate = paused ? 0.0 : player->GetPlaySpeed();
+    const double rate = paused ? 0.0 : player->GetPlaySpeed() * player->GetPlayTempo();
     const CMTime time = CMTimeMake(current, 1000);
     if (fabs(CMTimeGetSeconds(CMTimeSubtract(CMTimebaseGetTime(m_pipTimebase), time))) > 0.25)
       CMTimebaseSetTime(m_pipTimebase, time);
@@ -1276,6 +1580,8 @@ void ScheduleHDRDelivery()
   }
   m_pipController.requiresLinearPlayback = !playing || !player->CanSeek() || maximum <= minimum;
   m_foldPiP.enabled = playing && (m_pipController.pictureInPicturePossible || pipActive.load());
+  if (m_foldSettingsPage)
+    [self refreshFoldSettings];
 }
 
 - (void)togglePictureInPicture:(UIButton*)sender

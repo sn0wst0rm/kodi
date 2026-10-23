@@ -2936,6 +2936,17 @@ void CVideoPlayer::HandleMessages()
     {
       int speed = std::static_pointer_cast<CDVDMsgPlayerSetSpeed>(pMsg)->GetSpeed();
 
+#if defined(TARGET_DARWIN_IOS)
+      // Choosing a tempo while paused changes the next playback rate, not the
+      // pause state. Explicit resume sets NewSpeed before sending this message.
+      if (std::static_pointer_cast<CDVDMsgPlayerSetSpeed>(pMsg)->IsTempo() &&
+          m_playSpeed == DVD_PLAYSPEED_PAUSE && m_processInfo->GetNewSpeed() == 0)
+      {
+        m_processInfo->SetTempo(static_cast<float>(speed) / DVD_PLAYSPEED_NORMAL);
+        continue;
+      }
+#endif
+
       // correct our current clock, as it would start going wrong otherwise
       if (m_State.timestamp > 0)
       {
@@ -3517,11 +3528,11 @@ void CVideoPlayer::SetTempo(float tempo)
   tempo = floor(tempo * 100.0f + 0.5f) / 100.0f;
   if (m_processInfo->IsTempoAllowed(tempo))
   {
+    m_processInfo->SetNewTempo(tempo);
     int speed = tempo * DVD_PLAYSPEED_NORMAL;
     CDVDMsgPlayerSetSpeed::SpeedParams params = { speed, true };
     m_messenger.Put(std::make_shared<CDVDMsgPlayerSetSpeed>(params));
 
-    m_processInfo->SetNewTempo(tempo);
   }
 }
 
@@ -4924,6 +4935,12 @@ void CVideoPlayer::UpdatePlayState(double timeout)
     {
       state.cantempo = false;
     }
+
+#if defined(TARGET_DARWIN_IOS)
+    // Native AVSampleBuffer video also runs while the GUI/display link sleeps
+    // in PiP. Tempo follows the media clock; it must not require display sync.
+    state.cantempo = !realtime && !m_VideoPlayerAudio->IsPassthrough();
+#endif
 
     m_processInfo->SetStateRealtime(realtime);
   }
