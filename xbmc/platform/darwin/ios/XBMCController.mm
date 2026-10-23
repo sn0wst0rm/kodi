@@ -120,6 +120,7 @@ public:
   UIStackView* m_foldControls;
   BOOL m_hasActiveFold;
   UIInterfaceOrientation m_lastLandscapeOrientation;
+  BOOL m_landscapeRequestPending;
 }
 - (void)rescheduleNetworkAutoSuspend;
 @end
@@ -204,7 +205,10 @@ public:
 }
 - (BOOL)prefersInterfaceOrientationLocked
 {
-  return NO;
+  // Keep system chrome landscape when held vertically, but allow UIKit to
+  // choose either landscape direction and to manage its own rotation lock.
+  return !m_hasActiveFold &&
+         !UIDeviceOrientationIsLandscape(UIDevice.currentDevice.orientation);
 }
 
 - (BOOL)prefersStatusBarHidden
@@ -593,6 +597,7 @@ public:
                  name: nil
                object: nil];
 
+  [UIDevice.currentDevice beginGeneratingDeviceOrientationNotifications];
   orientation = UIInterfaceOrientationLandscapeLeft;
 
   g_xbmcController = self;
@@ -689,7 +694,11 @@ public:
       }
     }
   }
-  m_hasActiveFold = hasActiveFold;
+  if (m_hasActiveFold != hasActiveFold)
+  {
+    m_hasActiveFold = hasActiveFold;
+    dispatch_async(dispatch_get_main_queue(), ^{ [self updateOrientationForSceneGeometry]; });
+  }
   m_foldControls.hidden = CGRectIsEmpty(controls);
   if (!m_foldControls.hidden)
   {
@@ -755,6 +764,7 @@ public:
 //--------------------------------------------------------------
 - (void)dealloc
 {
+  [UIDevice.currentDevice endGeneratingDeviceOrientationNotifications];
   // stop background task
   [m_networkAutoSuspendTimer invalidate];
   [self enableNetworkAutoSuspend:nil];
@@ -783,11 +793,29 @@ public:
 {
   if (@available(iOS 26.0, *))
   {
-    // Used only to preserve the last physical landscape direction during a
-    // portrait scene transition; layout dimensions come from view bounds.
-    UIInterfaceOrientation current = self.view.window.windowScene.effectiveGeometry.interfaceOrientation;
+    [self setNeedsUpdateOfPrefersInterfaceOrientationLocked];
+    UIWindowScene* scene = self.view.window.windowScene;
+    UIInterfaceOrientation current = scene.effectiveGeometry.interfaceOrientation;
     if (UIInterfaceOrientationIsLandscape(current))
+    {
       m_lastLandscapeOrientation = current;
+      m_landscapeRequestPending = NO;
+    }
+    else if (!m_hasActiveFold && scene && !m_landscapeRequestPending)
+    {
+      m_landscapeRequestPending = YES;
+      UIInterfaceOrientationMask mask = m_lastLandscapeOrientation
+          ? (UIInterfaceOrientationMask)(1 << m_lastLandscapeOrientation)
+          : UIInterfaceOrientationMaskLandscape;
+      UIWindowSceneGeometryPreferencesIOS* preference =
+          [[UIWindowSceneGeometryPreferencesIOS alloc] initWithInterfaceOrientations:mask];
+      [scene requestGeometryUpdateWithPreferences:preference errorHandler:^(NSError* error) {
+        m_landscapeRequestPending = NO;
+        CLog::Log(LOGWARNING, "Duo landscape request: {}", error.localizedDescription.UTF8String);
+      }];
+    }
+    else if (m_hasActiveFold)
+      m_landscapeRequestPending = NO;
   }
   [self.view setNeedsLayout];
 }
@@ -1192,6 +1220,8 @@ public:
 //
 - (void)observeDefaultCenterStuff: (NSNotification *) notification
 {
+  if ([notification.name isEqualToString:UIDeviceOrientationDidChangeNotification])
+    [self updateOrientationForSceneGeometry];
 //  LOG(@"default: %@", [notification name]);
 //  LOG(@"userInfo: %@", [notification userInfo]);
 }
