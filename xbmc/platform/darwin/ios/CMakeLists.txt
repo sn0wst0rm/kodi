@@ -12,8 +12,10 @@ set(HEADERS IOSEAGLView.h
             XBMCApplication.h
             XBMCController.h)
 
-# Keep per-pixel subtitle composition efficient in device Debug builds too.
-# Debug symbols remain enabled; no GPU work is submitted by this helper.
-set_source_files_properties(IOSVideoCompositor.mm PROPERTIES COMPILE_OPTIONS "-O2")
-
 core_add_library(platform_ios)
+
+# The monolithic iOS target is created in the root directory; attach source
+# options there as well as in the standalone-library configuration.
+set_source_files_properties("${CMAKE_CURRENT_SOURCE_DIR}/IOSVideoCompositor.mm"
+                           TARGET_DIRECTORY ${CORE_LIBRARY}
+                           PROPERTIES COMPILE_OPTIONS "-O2")
