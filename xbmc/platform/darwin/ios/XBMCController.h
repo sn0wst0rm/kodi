@@ -60,6 +60,7 @@
 - (void) observeDefaultCenterStuff: (NSNotification *) notification;
 - (CGRect)fullscreenSubviewFrame;
 - (void)onXbmcAlive;
+- (void)updateOrientationForSceneGeometry;
 - (void)setGUIInsetsFromMainThread:(BOOL)isMainThread;
 - (BOOL) setFramebuffer;
 - (bool) presentFramebuffer;

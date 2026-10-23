@@ -119,6 +119,7 @@ public:
   std::unique_ptr<DebugLogSharingPresenter> m_debugLogSharingPresenter;
   UIStackView* m_foldControls;
   BOOL m_hasActiveFold;
+  UIInterfaceOrientation m_lastLandscapeOrientation;
 }
 - (void)rescheduleNetworkAutoSuspend;
 @end
@@ -690,6 +691,9 @@ public:
   if (m_hasActiveFold != hasActiveFold)
   {
     m_hasActiveFold = hasActiveFold;
+    dispatch_async(dispatch_get_main_queue(), ^{
+      [self updateOrientationForSceneGeometry];
+    });
     if (@available(iOS 16.0, *))
       [self setNeedsUpdateOfSupportedInterfaceOrientations];
   }
@@ -755,19 +759,37 @@ public:
   [super viewWillAppear:animated];
 }
 //--------------------------------------------------------------
+- (void)updateOrientationForSceneGeometry
+{
+  if (@available(iOS 26.0, *))
+  {
+    UIWindowScene* scene = self.view.window.windowScene;
+    if (!scene || m_hasActiveFold)
+      return;
+    // This is rotation policy, not a layout/aspect-ratio inference.
+    UIInterfaceOrientation current = scene.effectiveGeometry.interfaceOrientation;
+    if (UIInterfaceOrientationIsLandscape(current))
+    {
+      m_lastLandscapeOrientation = current;
+      return;
+    }
+    [self setNeedsUpdateOfSupportedInterfaceOrientations];
+    UIInterfaceOrientationMask mask = m_lastLandscapeOrientation
+        ? (UIInterfaceOrientationMask)(1 << m_lastLandscapeOrientation)
+        : UIInterfaceOrientationMaskLandscape;
+    UIWindowSceneGeometryPreferencesIOS* preferences =
+        [[UIWindowSceneGeometryPreferencesIOS alloc] initWithInterfaceOrientations:mask];
+    [scene requestGeometryUpdateWithPreferences:preferences errorHandler:^(NSError* error) {
+      NSLog(@"Kodi landscape preference: %@", error.localizedDescription);
+    }];
+  }
+}
+
 -(void) viewDidAppear:(BOOL)animated
 {
   [super viewDidAppear:animated];
 
-  if (@available(iOS 16.0, *))
-  {
-    [self setNeedsUpdateOfSupportedInterfaceOrientations];
-    UIWindowSceneGeometryPreferencesIOS* preferences =
-        [[UIWindowSceneGeometryPreferencesIOS alloc] initWithInterfaceOrientations:self.supportedInterfaceOrientations];
-    [self.view.window.windowScene requestGeometryUpdateWithPreferences:preferences errorHandler:^(NSError* error) {
-      NSLog(@"Kodi landscape preference: %@", error.localizedDescription);
-    }];
-  }
+  [self updateOrientationForSceneGeometry];
   [self setNeedsStatusBarAppearanceUpdate];
   if (@available(iOS 26.0, *))
     [self setNeedsUpdateOfPrefersInterfaceOrientationLocked];

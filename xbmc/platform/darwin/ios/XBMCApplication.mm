@@ -45,6 +45,8 @@
     didUpdateEffectiveGeometry:(UIWindowSceneGeometry*)previousGeometry
 {
   [g_xbmcController.view setNeedsLayout];
+  [g_xbmcController.view layoutIfNeeded];
+  [g_xbmcController updateOrientationForSceneGeometry];
 }
 
 - (void)sceneWillResignActive:(UIScene*)scene
