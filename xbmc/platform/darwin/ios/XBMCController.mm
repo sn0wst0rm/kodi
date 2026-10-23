@@ -1310,7 +1310,7 @@ void ScheduleHDRDelivery()
   const BOOL enabled = [self foldHDREnabled];
   if (@available(iOS 26.0, *))
     m_hdrLayer.preferredDynamicRange = enabled ? CADynamicRangeHigh : CADynamicRangeStandard;
-  else
+  else if (@available(iOS 17.0, *))
     m_hdrLayer.wantsExtendedDynamicRangeContent = enabled;
 }
 
@@ -1418,7 +1418,16 @@ void ScheduleHDRDelivery()
 
 - (void)renderFoldSettings
 {
-  if (!m_foldSettingsPage) return;
+  if (!m_foldSettingsPage)
+  {
+    // A hidden vertical stack must not retain required row-height constraints.
+    for (UIView* view in m_foldSettingsPanel.arrangedSubviews)
+    {
+      [m_foldSettingsPanel removeArrangedSubview:view];
+      [view removeFromSuperview];
+    }
+    return;
+  }
   const auto state = m_foldSettingsState;
   const BOOL playing = state && state->playing;
   const BOOL hdr = playing && [self foldSourceIsHDR];
