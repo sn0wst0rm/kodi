@@ -198,8 +198,9 @@ public:
 
 - (UIInterfaceOrientationMask)supportedInterfaceOrientations
 {
-  // Tabletop needs a tall scene containing a landscape canvas above controls.
-  return m_hasActiveFold ? UIInterfaceOrientationMaskAll : UIInterfaceOrientationMaskLandscape;
+  // Let UIKit handle physical rotation and the system rotation lock. The GL
+  // canvas stays landscape even when a resizable scene has portrait bounds.
+  return UIInterfaceOrientationMaskAll;
 }
 - (BOOL)prefersInterfaceOrientationLocked
 {
@@ -688,15 +689,7 @@ public:
       }
     }
   }
-  if (m_hasActiveFold != hasActiveFold)
-  {
-    m_hasActiveFold = hasActiveFold;
-    dispatch_async(dispatch_get_main_queue(), ^{
-      [self updateOrientationForSceneGeometry];
-    });
-    if (@available(iOS 16.0, *))
-      [self setNeedsUpdateOfSupportedInterfaceOrientations];
-  }
+  m_hasActiveFold = hasActiveFold;
   m_foldControls.hidden = CGRectIsEmpty(controls);
   if (!m_foldControls.hidden)
   {
@@ -706,8 +699,35 @@ public:
                                      CGRectGetMidY(usable) - 36, MAX(width, 0), 72);
   }
   screenScale = self.traitCollection.displayScale;
-  if (!CGRectEqualToRect(m_glView.frame, drawable))
-    m_glView.frame = drawable;
+  CGSize canvasSize = drawable.size;
+  CGAffineTransform canvasTransform = CGAffineTransformIdentity;
+  if (canvasSize.height > canvasSize.width)
+  {
+    // A portrait scene must not stretch Estuary's landscape canvas. Transform
+    // the view itself, so UIKit also converts touch coordinates correctly.
+    canvasSize = CGSizeMake(drawable.size.height, drawable.size.width);
+    CGFloat angle = m_lastLandscapeOrientation == UIInterfaceOrientationLandscapeLeft
+        ? -M_PI_2 : M_PI_2;
+    if (@available(iOS 26.0, *))
+    {
+      if (self.view.window.windowScene.effectiveGeometry.interfaceOrientation ==
+          UIInterfaceOrientationPortraitUpsideDown)
+        angle = -angle;
+    }
+    canvasTransform = CGAffineTransformMakeRotation(angle);
+  }
+  CGRect canvasBounds = CGRectMake(0, 0, canvasSize.width, canvasSize.height);
+  if (!CGRectEqualToRect(m_glView.bounds, canvasBounds) ||
+      !CGAffineTransformEqualToTransform(m_glView.transform, canvasTransform))
+  {
+    m_glView.transform = CGAffineTransformIdentity;
+    m_glView.bounds = canvasBounds;
+    m_glView.transform = canvasTransform;
+    CLog::Log(LOGINFO, "Duo canvas {}x{}, scene {}x{}, tabletop={}",
+              canvasSize.width, canvasSize.height, self.view.bounds.size.width,
+              self.view.bounds.size.height, !m_foldControls.hidden);
+  }
+  m_glView.center = CGPointMake(CGRectGetMidX(drawable), CGRectGetMidY(drawable));
   [m_glView resizeFrameBuffer];
 }
 
@@ -763,26 +783,13 @@ public:
 {
   if (@available(iOS 26.0, *))
   {
-    UIWindowScene* scene = self.view.window.windowScene;
-    if (!scene || m_hasActiveFold)
-      return;
-    // This is rotation policy, not a layout/aspect-ratio inference.
-    UIInterfaceOrientation current = scene.effectiveGeometry.interfaceOrientation;
+    // Used only to preserve the last physical landscape direction during a
+    // portrait scene transition; layout dimensions come from view bounds.
+    UIInterfaceOrientation current = self.view.window.windowScene.effectiveGeometry.interfaceOrientation;
     if (UIInterfaceOrientationIsLandscape(current))
-    {
       m_lastLandscapeOrientation = current;
-      return;
-    }
-    [self setNeedsUpdateOfSupportedInterfaceOrientations];
-    UIInterfaceOrientationMask mask = m_lastLandscapeOrientation
-        ? (UIInterfaceOrientationMask)(1 << m_lastLandscapeOrientation)
-        : UIInterfaceOrientationMaskLandscape;
-    UIWindowSceneGeometryPreferencesIOS* preferences =
-        [[UIWindowSceneGeometryPreferencesIOS alloc] initWithInterfaceOrientations:mask];
-    [scene requestGeometryUpdateWithPreferences:preferences errorHandler:^(NSError* error) {
-      NSLog(@"Kodi landscape preference: %@", error.localizedDescription);
-    }];
   }
+  [self.view setNeedsLayout];
 }
 
 -(void) viewDidAppear:(BOOL)animated
