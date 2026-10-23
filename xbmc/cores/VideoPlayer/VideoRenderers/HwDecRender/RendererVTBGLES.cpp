@@ -17,6 +17,7 @@
 #include "utils/log.h"
 #if defined(TARGET_DARWIN_IOS)
 #include "platform/darwin/ios/IOSHDRVideo.h"
+#include "RendererIOS.h"
 #include "windowing/ios/WinSystemIOS.h"
 #define WIN_SYSTEM_CLASS CWinSystemIOS
 #elif defined(TARGET_DARWIN_TVOS)
@@ -34,7 +35,13 @@ CBaseRenderer* CRendererVTB::Create(CVideoBuffer *buffer)
 {
   VTB::CVideoBufferVTB *vb = dynamic_cast<VTB::CVideoBufferVTB*>(buffer);
   if (vb)
+  {
+#if defined(TARGET_DARWIN_IOS)
+    if (IOSSupportsHDRVideo())
+      return new CRendererIOS();
+#endif
     return new CRendererVTB();
+  }
 
   return nullptr;
 }

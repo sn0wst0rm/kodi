@@ -609,3 +609,109 @@ void CRenderer::LoadSettings()
   m_subtitleAlign = settings->GetAlignment();
   ResetSubtitlePosition();
 }
+
+#if defined(TARGET_DARWIN_IOS)
+std::shared_ptr<IOSSubtitleBitmap> CRenderer::RenderNative(int idx, int videoWidth, int videoHeight)
+{
+  std::unique_lock<CCriticalSection> lock(m_section);
+  if (m_buffers[idx].empty() || videoWidth <= 0 || videoHeight <= 0)
+  {
+    m_nativeBitmap.reset();
+    return {};
+  }
+  const bool changed = m_isSettingsChanged.exchange(false);
+  const bool update = !m_overlayStyle || changed;
+  if (update)
+  {
+    LoadSettings();
+    CreateSubtitlesStyle();
+  }
+  // Only rasterize subtitles at PiP resolution. Native presentation keeps
+  // decoding in VideoToolbox; composition never submits background GPU work.
+  const double scale = std::min({1.0, 960.0 / videoWidth, 540.0 / videoHeight});
+  const int width = std::max(2, int(videoWidth * scale) & ~1);
+  const int height = std::max(2, int(videoHeight * scale) & ~1);
+  auto bitmap = std::make_shared<IOSSubtitleBitmap>();
+  bitmap->width = width;
+  bitmap->height = height;
+  bitmap->rgba.resize(width * height * 4);
+  const auto blend = [&](int x, int y, int r, int g, int b, int a) {
+    if (x < 0 || y < 0 || x >= width || y >= height || !a) return;
+    auto* out = bitmap->rgba.data() + (y * width + x) * 4;
+    out[0] = (r * a + out[0] * (255 - a) + 127) / 255;
+    out[1] = (g * a + out[1] * (255 - a) + 127) / 255;
+    out[2] = (b * a + out[2] * (255 - a) + 127) / 255;
+    out[3] = a + (out[3] * (255 - a) + 127) / 255;
+  };
+  bool any = false;
+  for (const auto& element : m_buffers[idx])
+  {
+    if (auto* ass = dynamic_cast<CDVDOverlayLibass*>(element.overlay_dvd.get()))
+    {
+      SUBTITLES::STYLE::renderOpts opts{};
+      opts.frameWidth = opts.videoWidth = width;
+      opts.frameHeight = opts.videoHeight = height;
+      opts.sourceWidth = videoWidth;
+      opts.sourceHeight = videoHeight;
+      opts.m_par = 1;
+      opts.marginsMode = SUBTITLES::STYLE::MarginsMode::INSIDE_VIDEO;
+      auto* images = ass->GetLibassHandler()->RenderImage(element.pts, opts, update, m_overlayStyle);
+      for (auto* image = images; image; image = image->next)
+      {
+        any = true;
+        const int alpha = 255 - (image->color & 255);
+        for (int y = 0; y < image->h; ++y)
+          for (int x = 0; x < image->w; ++x)
+            blend(image->dst_x + x, image->dst_y + y, image->color >> 24,
+                  (image->color >> 16) & 255, (image->color >> 8) & 255,
+                  (image->bitmap[y * image->stride + x] * alpha + 127) / 255);
+      }
+    }
+    else if (auto* image = dynamic_cast<CDVDOverlayImage*>(element.overlay_dvd.get()))
+    {
+      if (image->width <= 0 || image->height <= 0 || image->pixels.empty()) continue;
+      const double sx = double(width) / (image->source_width > 0 ? image->source_width : videoWidth);
+      const double sy = double(height) / (image->source_height > 0 ? image->source_height : videoHeight);
+      for (int y = std::max(0, int(image->y * sy)); y < std::min(height, int((image->y + image->height) * sy)); ++y)
+        for (int x = std::max(0, int(image->x * sx)); x < std::min(width, int((image->x + image->width) * sx)); ++x)
+        {
+          const int px = std::clamp(int(x / sx) - image->x, 0, image->width - 1);
+          const int py = std::clamp(int(y / sy) - image->y, 0, image->height - 1);
+          uint32_t color = 0;
+          if (!image->palette.empty())
+          {
+            const unsigned index = image->pixels[py * image->linesize + px];
+            if (index < image->palette.size()) color = image->palette[index];
+          }
+          else
+            memcpy(&color, image->pixels.data() + py * image->linesize + px * 4, 4);
+          blend(x, y, (color >> 16) & 255, (color >> 8) & 255, color & 255, color >> 24);
+        }
+      any = true;
+    }
+    else if (auto* spu = dynamic_cast<CDVDOverlaySpu*>(element.overlay_dvd.get()))
+    {
+      if (spu->width <= 0 || spu->height <= 0) continue;
+      std::vector<uint32_t> pixels(spu->width * spu->height);
+      int left, right, top, bottom;
+      convert_rgba(*spu, false, left, right, top, bottom, pixels);
+      for (int y = 0; y < height; ++y)
+        for (int x = 0; x < width; ++x)
+        {
+          const int px = x * videoWidth / width - spu->x;
+          const int py = y * videoHeight / height - spu->y;
+          if (px < 0 || py < 0 || px >= spu->width || py >= spu->height) continue;
+          const uint32_t color = pixels[py * spu->width + px];
+          blend(x, y, (color >> 16) & 255, (color >> 8) & 255, color & 255, color >> 24);
+        }
+      any = true;
+    }
+  }
+  if (!any) return {};
+  if (m_nativeBitmap && m_nativeBitmap->width == width && m_nativeBitmap->height == height &&
+      m_nativeBitmap->rgba == bitmap->rgba)
+    return m_nativeBitmap;
+  m_nativeBitmap = bitmap;
+  return bitmap;
+}
+#endif

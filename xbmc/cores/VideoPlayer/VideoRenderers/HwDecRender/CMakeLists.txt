@@ -41,6 +41,11 @@ if(CORE_SYSTEM_NAME STREQUAL darwin_embedded)
   endif()
 endif()
 
+if("ios" IN_LIST CORE_PLATFORM_NAME_LC)
+  list(APPEND SOURCES RendererIOS.cpp)
+  list(APPEND HEADERS RendererIOS.h)
+endif()
+
 if(CORE_SYSTEM_NAME STREQUAL android)
   list(APPEND SOURCES RendererMediaCodec.cpp
                       RendererMediaCodecSurface.cpp)

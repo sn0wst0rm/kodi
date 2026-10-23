@@ -33,7 +33,6 @@
 
   UIInterfaceOrientation orientation;
 
-  bool m_isPlayingBeforeInactive;
   UIBackgroundTaskIdentifier m_bgTask;
   NSTimer *m_networkAutoSuspendTimer;
   bool nativeKeyboardActive;

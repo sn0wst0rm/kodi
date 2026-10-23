@@ -25,6 +25,9 @@
 #include "windowing/ios/WinSystemIOS.h"
 
 #include <cmath>
+#include <mutex>
+#include <vector>
+#include "platform/darwin/ios/IOSHDRVideo.h"
 
 #import "platform/darwin/DarwinUtils.h"
 #import "platform/darwin/NSLogDebugHelpers.h"
@@ -37,6 +40,32 @@
 #import <OpenGLES/ES2/glext.h>
 #import <QuartzCore/QuartzCore.h>
 #include <sys/resource.h>
+
+namespace
+{
+std::mutex deferredTextureMutex;
+std::vector<GLuint> deferredVideoTextures;
+}
+void IOSDeleteVideoTexture(unsigned int texture)
+{
+  if (!texture) return;
+  if (g_application.GetRenderGUI())
+    glDeleteTextures(1, &texture);
+  else
+  {
+    std::lock_guard<std::mutex> lock(deferredTextureMutex);
+    deferredVideoTextures.push_back(texture);
+  }
+}
+void IOSDrainVideoTextures()
+{
+  std::lock_guard<std::mutex> lock(deferredTextureMutex);
+  if (!deferredVideoTextures.empty())
+  {
+    glDeleteTextures(deferredVideoTextures.size(), deferredVideoTextures.data());
+    deferredVideoTextures.clear();
+  }
+}
 
 //--------------------------------------------------------------
 @interface IOSEAGLView (PrivateMethods)
@@ -270,6 +299,7 @@
     if ([EAGLContext currentContext] != context)
       [EAGLContext setCurrentContext:context];
 
+    IOSDrainVideoTextures();
     if (CACurrentMediaTime() < framebufferRetryTime)
       return NO;
 
@@ -334,11 +364,20 @@
 //--------------------------------------------------------------
 - (void) pauseAnimation
 {
-  PRINT_SIGNATURE();
+  if (pause) return;
+  if (xbmcAlive)
+  {
+    // Finish outstanding GL work on its owning thread before returning to
+    // UIKit's background transition. Do not transfer EAGLContext to UIKit.
+    KODI::MESSAGING::ThreadMessageCallback callback;
+    callback.userptr = nullptr;
+    callback.callback = [](void*) {
+      if (auto port = CServiceBroker::GetAppPort()) port->SetRenderGUI(false);
+      glFinish();
+    };
+    CServiceBroker::GetAppMessenger()->SendMsg(TMSG_CALLBACK, -1, -1, &callback);
+  }
   pause = TRUE;
-  std::shared_ptr<CAppInboundProtocol> appPort = CServiceBroker::GetAppPort();
-  if (appPort)
-    appPort->SetRenderGUI(false);
 }
 //--------------------------------------------------------------
 - (void) resumeAnimation

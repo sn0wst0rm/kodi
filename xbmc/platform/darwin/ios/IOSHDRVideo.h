@@ -9,6 +9,15 @@
 #include <CoreVideo/CVPixelBuffer.h>
 #include <array>
 #include <cstdint>
+#include <memory>
+#include <vector>
+
+struct IOSSubtitleBitmap
+{
+  int width{0};
+  int height{0};
+  std::vector<uint8_t> rgba; // premultiplied RGBA, top row first
+};
 
 struct IOSHDRVideoMetadata
 {
@@ -28,5 +37,12 @@ bool IOSIsTenBitVideo(CVPixelBufferRef buffer);
 uint64_t IOSBeginHDRVideo();
 void IOSPresentHDRVideo(uint64_t session, CVPixelBufferRef buffer,
                         const IOSHDRVideoMetadata& metadata, CGRect source, CGRect destination,
-                        unsigned int orientation);
+                        unsigned int orientation,
+                        std::shared_ptr<IOSSubtitleBitmap> subtitles = {});
 void IOSEndHDRVideo(uint64_t session);
+bool IOSIsPictureInPictureActive();
+bool IOSNativeVideoRenderingActive();
+CVPixelBufferRef IOSCompositeVideo(CVPixelBufferRef video, const IOSSubtitleBitmap& subtitles);
+
+void IOSDeleteVideoTexture(unsigned int texture);
+void IOSDrainVideoTextures();

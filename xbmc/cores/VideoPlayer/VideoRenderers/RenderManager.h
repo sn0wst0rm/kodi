@@ -143,6 +143,7 @@ protected:
   void UpdateLatencyTweak();
   void CheckEnableClockSync();
 
+  std::atomic_bool m_nativeIOSRenderer{false};
   CBaseRenderer *m_pRenderer = nullptr;
   OVERLAY::CRenderer m_overlays;
   CDebugRenderer m_debugRenderer;

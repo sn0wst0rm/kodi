@@ -16,6 +16,7 @@
 #include "application/ApplicationComponents.h"
 #include "application/ApplicationPlayer.h"
 #include "cores/DataCacheCore.h"
+#include "cores/AudioEngine/Interfaces/AE.h"
 #include "filesystem/SpecialProtocol.h"
 #include "guilib/GUIControl.h"
 #include "guilib/GUIComponent.h"
@@ -47,6 +48,7 @@
 #import "platform/darwin/ios-common/DarwinEmbedNowPlayingInfoManager.h"
 #import "platform/darwin/ios/IOSEAGLView.h"
 #include "platform/darwin/ios/IOSHDRVideo.h"
+#include "platform/darwin/ios/IOSPlaybackPolicy.h"
 #import "platform/darwin/ios/IOSScreenManager.h"
 #import "platform/darwin/ios/XBMCApplication.h"
 
@@ -57,9 +59,11 @@
 #include <math.h>
 #include <algorithm>
 #include <mutex>
+#include <atomic>
 #include <signal.h>
 
 #import <AVFoundation/AVAudioSession.h>
+#import <AVKit/AVKit.h>
 #import <AVFoundation/AVSampleBufferDisplayLayer.h>
 #import <AVFoundation/AVSampleBufferVideoRenderer.h>
 #include <sys/resource.h>
@@ -80,6 +84,7 @@ struct IOSHDRFrame
   CVPixelBufferRef buffer;
   uint64_t session{0};
   IOSHDRVideoMetadata metadata;
+  std::shared_ptr<IOSSubtitleBitmap> subtitles;
   CGRect source;
   CGRect destination;
   unsigned int orientation{0};
@@ -92,6 +97,7 @@ std::shared_ptr<IOSHDRFrame> hdrPendingFrame;
 uint64_t hdrSessionCounter{0};
 uint64_t hdrActiveSession{0};
 bool hdrDeliveryScheduled{false};
+std::atomic_bool pipActive{false};
 void ScheduleHDRDelivery(); // caller holds hdrMutex
 }
 
@@ -122,7 +128,7 @@ uint64_t IOSBeginHDRVideo()
 
 void IOSPresentHDRVideo(uint64_t session, CVPixelBufferRef buffer,
                         const IOSHDRVideoMetadata& metadata, CGRect source, CGRect destination,
-                        unsigned int orientation)
+                        unsigned int orientation, std::shared_ptr<IOSSubtitleBitmap> subtitles)
 {
   if (!session || !buffer || CGRectIsEmpty(source) || CGRectIsEmpty(destination))
     return;
@@ -132,6 +138,7 @@ void IOSPresentHDRVideo(uint64_t session, CVPixelBufferRef buffer,
   frame->source = source;
   frame->destination = destination;
   frame->orientation = orientation;
+  frame->subtitles = std::move(subtitles);
   std::lock_guard<std::mutex> lock(hdrMutex);
   if (session != hdrActiveSession)
     return;
@@ -236,7 +243,7 @@ public:
 //--------------------------------------------------------------
 //
 
-@interface XBMCController ()
+@interface XBMCController () <AVPictureInPictureControllerDelegate, AVPictureInPictureSampleBufferPlaybackDelegate>
 {
   std::unique_ptr<DebugLogSharingPresenter> m_debugLogSharingPresenter;
   UIStackView* m_foldControls;
@@ -245,6 +252,15 @@ public:
   UIButton* m_foldDuration;
   BOOL m_foldShowRemaining;
   UIButton* m_foldPlayPause;
+  UIButton* m_foldPiP;
+  AVPictureInPictureController* m_pipController;
+  CMTimebaseRef m_pipTimebase;
+  NSTimer* m_pipTimer;
+  BOOL m_restoringPiP;
+  IOSPlaybackPolicy m_audioPolicy;
+  uint64_t m_pipStateSession;
+  BOOL m_pipStatePaused;
+  int64_t m_pipStateMaximum;
   UIButton* m_foldBackward;
   UIButton* m_foldForward;
   NSArray<UIButton*>* m_foldPlaybackButtons;
@@ -274,26 +290,86 @@ public:
 - (void)displayHDRFrame:(const std::shared_ptr<IOSHDRFrame>&)frame;
 - (void)layoutHDRVideo;
 - (void)resetHDRVideo;
+- (void)updatePictureInPictureState;
 @end
+
+bool IOSIsPictureInPictureActive() { return pipActive.load(); }
+bool IOSNativeVideoRenderingActive()
+{
+  std::lock_guard<std::mutex> lock(hdrMutex);
+  return hdrActiveSession != 0;
+}
 
 namespace
 {
+void FillVideoMetadata(const IOSHDRFrame& frame)
+{
+  CVPixelBufferRef pixel = frame.buffer;
+  const auto& metadata = frame.metadata;
+  const auto setMissing = [pixel](CFStringRef key, CFTypeRef value) {
+    if (value && !CVBufferHasAttachment(pixel, key))
+      CVBufferSetAttachment(pixel, key, value, kCVAttachmentMode_ShouldPropagate);
+  };
+  // Preserve per-frame metadata already propagated by VideoToolbox,
+  // including Dolby Vision. Fill missing colour/HDR10 signalling only.
+  setMissing(kCVImageBufferColorPrimariesKey,
+             CVColorPrimariesGetStringForIntegerCodePoint(metadata.primaries));
+  setMissing(kCVImageBufferTransferFunctionKey,
+             CVTransferFunctionGetStringForIntegerCodePoint(metadata.transfer));
+  setMissing(kCVImageBufferYCbCrMatrixKey,
+             CVYCbCrMatrixGetStringForIntegerCodePoint(metadata.matrix));
+  if (metadata.hasMastering)
+  {
+    CFDataRef data = CFDataCreate(nullptr, metadata.mastering.data(), metadata.mastering.size());
+    setMissing(kCVImageBufferMasteringDisplayColorVolumeKey, data);
+    CFRelease(data);
+  }
+  if (metadata.hasLight)
+  {
+    CFDataRef data = CFDataCreate(nullptr, metadata.light.data(), metadata.light.size());
+    setMissing(kCVImageBufferContentLightLevelInfoKey, data);
+    CFRelease(data);
+  }
+}
+
 void ScheduleHDRDelivery()
 {
   if (hdrDeliveryScheduled)
     return;
   hdrDeliveryScheduled = true;
-  dispatch_async(dispatch_get_main_queue(), ^{
-    std::shared_ptr<IOSHDRFrame> frame;
+  static dispatch_queue_t deliveryQueue = dispatch_queue_create("org.kodi.native-video", DISPATCH_QUEUE_SERIAL);
+  dispatch_async(deliveryQueue, ^{
+    @autoreleasepool
     {
-      std::lock_guard<std::mutex> lock(hdrMutex);
-      frame = std::move(hdrPendingFrame);
-      hdrDeliveryScheduled = false;
+      std::shared_ptr<IOSHDRFrame> frame;
+      {
+        std::lock_guard<std::mutex> lock(hdrMutex);
+        frame = std::move(hdrPendingFrame);
+      }
+      if (frame) FillVideoMetadata(*frame);
+      if (frame && frame->subtitles && IOSIsPictureInPictureActive())
+      {
+        CVPixelBufferRef composited = IOSCompositeVideo(frame->buffer, *frame->subtitles);
+        if (composited)
+        {
+          CVPixelBufferRelease(frame->buffer);
+          frame->buffer = composited;
+        }
+      }
+      dispatch_async(dispatch_get_main_queue(), ^{
+        bool current;
+        {
+          std::lock_guard<std::mutex> lock(hdrMutex);
+          current = frame && frame->session == hdrActiveSession;
+          hdrDeliveryScheduled = false;
+          if (hdrPendingFrame) ScheduleHDRDelivery();
+        }
+        if (current)
+          [g_xbmcController displayHDRFrame:frame];
+        else if (!IOSNativeVideoRenderingActive())
+          [g_xbmcController resetHDRVideo];
+      });
     }
-    if (frame)
-      [g_xbmcController displayHDRFrame:frame];
-    else
-      [g_xbmcController resetHDRVideo];
   });
 }
 }
@@ -324,6 +400,14 @@ void ScheduleHDRDelivery()
   m_hdrFailed = NO;
   m_glView.opaque = YES;
   m_glView.layer.opaque = YES;
+  if (!IOSNativeVideoRenderingActive())
+  {
+    [m_pipController stopPictureInPicture];
+    m_pipController.contentSource = nil;
+    [m_pipTimer invalidate];
+    m_pipTimer = nil;
+    m_foldPiP.enabled = NO;
+  }
 }
 
 - (void)layoutHDRVideo
@@ -385,7 +469,7 @@ void ScheduleHDRDelivery()
 {
   if (@available(iOS 17.0, *))
   {
-    if (!m_foldSceneActive || !m_glView.window)
+    if (!m_glView.window)
       return;
     {
       std::lock_guard<std::mutex> lock(hdrMutex);
@@ -416,6 +500,29 @@ void ScheduleHDRDelivery()
       else
         m_hdrLayer.wantsExtendedDynamicRangeContent = YES;
       [m_hdrCrop.layer addSublayer:m_hdrLayer];
+      CMTimebaseCreateWithSourceClock(kCFAllocatorDefault, CMClockGetHostTimeClock(), &m_pipTimebase);
+      m_hdrLayer.controlTimebase = m_pipTimebase;
+      if ([AVPictureInPictureController isPictureInPictureSupported])
+      {
+        m_pipController = [[AVPictureInPictureController alloc] initWithContentSource:
+            [[AVPictureInPictureControllerContentSource alloc] initWithSampleBufferDisplayLayer:m_hdrLayer
+                playbackDelegate:self]];
+        m_pipController.delegate = self;
+        m_pipController.canStartPictureInPictureAutomaticallyFromInline = YES;
+      }
+    }
+    if (m_pipController && !m_pipController.contentSource)
+      m_pipController.contentSource = [[AVPictureInPictureControllerContentSource alloc]
+          initWithSampleBufferDisplayLayer:m_hdrLayer playbackDelegate:self];
+    if (!m_pipTimer)
+    {
+      __weak XBMCController* weakSelf = self;
+      m_pipTimer = [NSTimer timerWithTimeInterval:0.5 repeats:YES block:^(NSTimer* timer) {
+        [weakSelf updatePictureInPictureState];
+      }];
+      m_pipTimer.tolerance = 0.1;
+      [[NSRunLoop mainRunLoop] addTimer:m_pipTimer forMode:NSRunLoopCommonModes];
+      [self updatePictureInPictureState];
     }
     bool sameImage = m_hdrEnqueuedFrame && m_hdrEnqueuedFrame->buffer == frame->buffer;
     m_hdrDisplayedFrame = frame;
@@ -434,37 +541,12 @@ void ScheduleHDRDelivery()
     if (!sameImage && renderer.readyForMoreMediaData)
     {
       CVPixelBufferRef pixel = frame->buffer;
-      const auto& metadata = frame->metadata;
-      const auto setMissing = [pixel](CFStringRef key, CFTypeRef value) {
-        if (value && !CVBufferHasAttachment(pixel, key))
-          CVBufferSetAttachment(pixel, key, value, kCVAttachmentMode_ShouldPropagate);
-      };
-      // Preserve per-frame metadata already propagated by VideoToolbox,
-      // including Dolby Vision. Fill missing colour/HDR10 signalling only.
-      setMissing(kCVImageBufferColorPrimariesKey,
-                 CVColorPrimariesGetStringForIntegerCodePoint(metadata.primaries));
-      setMissing(kCVImageBufferTransferFunctionKey,
-                 CVTransferFunctionGetStringForIntegerCodePoint(metadata.transfer));
-      setMissing(kCVImageBufferYCbCrMatrixKey,
-                 CVYCbCrMatrixGetStringForIntegerCodePoint(metadata.matrix));
-      if (metadata.hasMastering)
-      {
-        CFDataRef data = CFDataCreate(nullptr, metadata.mastering.data(), metadata.mastering.size());
-        setMissing(kCVImageBufferMasteringDisplayColorVolumeKey, data);
-        CFRelease(data);
-      }
-      if (metadata.hasLight)
-      {
-        CFDataRef data = CFDataCreate(nullptr, metadata.light.data(), metadata.light.size());
-        setMissing(kCVImageBufferContentLightLevelInfoKey, data);
-        CFRelease(data);
-      }
       CMVideoFormatDescriptionRef format = nullptr;
       CMSampleBufferRef sample = nullptr;
       OSStatus result = CMVideoFormatDescriptionCreateForImageBuffer(nullptr, pixel, &format);
       if (result == noErr)
       {
-        CMSampleTimingInfo timing = {kCMTimeInvalid, kCMTimeZero, kCMTimeInvalid};
+        CMSampleTimingInfo timing = {kCMTimeInvalid, CMTimebaseGetTime(m_pipTimebase), kCMTimeInvalid};
         result = CMSampleBufferCreateReadyWithImageBuffer(nullptr, pixel, format, &timing, &sample);
         CFRelease(format);
       }
@@ -948,7 +1030,6 @@ void ScheduleHDRDelivery()
 
   m_glView = NULL;
 
-  m_isPlayingBeforeInactive = NO;
   m_bgTask = UIBackgroundTaskInvalid;
 
 
@@ -958,6 +1039,20 @@ void ScheduleHDRDelivery()
              selector: @selector(observeDefaultCenterStuff:)
                  name: nil
                object: nil];
+
+  if (@available(iOS 27.0, *))
+  {
+    [center addObserver:self selector:@selector(audioSessionNotification:)
+        name:AVAudioSessionDidBecomeInactiveNotification object:nil];
+    [center addObserver:self selector:@selector(audioSessionNotification:)
+        name:AVAudioSessionResumptionRecommendationNotification object:nil];
+  }
+  else
+    [center addObserver:self selector:@selector(audioSessionNotification:)
+        name:AVAudioSessionInterruptionNotification object:nil];
+  for (NSNotificationName name in @[AVAudioSessionRouteChangeNotification,
+      AVAudioSessionMediaServicesWereLostNotification, AVAudioSessionMediaServicesWereResetNotification])
+    [center addObserver:self selector:@selector(audioSessionNotification:) name:name object:nil];
 
   orientation = UIInterfaceOrientationLandscapeLeft;
 
@@ -1107,6 +1202,19 @@ void ScheduleHDRDelivery()
     [playbackButtons addObject:button];
   }
   [m_foldControls addArrangedSubview:utilities];
+  UIStackView* navigation = [[UIStackView alloc] init];
+  navigation.distribution = UIStackViewDistributionFillEqually;
+  navigation.spacing = 16;
+  UIButton* back = [self foldButtonWithSymbol:@"chevron.backward" title:@"Indietro"];
+  back.tag = ACTION_NAV_BACK;
+  [back addTarget:self action:@selector(foldControlPressed:) forControlEvents:UIControlEventTouchUpInside];
+  [navigation addArrangedSubview:back];
+  m_foldPiP = [self foldButtonWithSymbol:@"pip.enter" title:@"PiP"];
+  m_foldPiP.accessibilityHint = @"Mostra il video in una finestra mobile";
+  m_foldPiP.enabled = NO;
+  [m_foldPiP addTarget:self action:@selector(togglePictureInPicture:) forControlEvents:UIControlEventTouchUpInside];
+  [navigation addArrangedSubview:m_foldPiP];
+  [m_foldControls addArrangedSubview:navigation];
   m_foldPlaybackButtons = playbackButtons;
   m_foldControls.hidden = YES;
   [self.view addSubview:m_foldControls];
@@ -1141,6 +1249,258 @@ void ScheduleHDRDelivery()
     ToggleFoldWindow(window);
 }
 
+- (void)updatePictureInPictureState
+{
+  if (!m_glView.isXBMCAlive) return;
+  const auto player = CServiceBroker::GetAppComponents().GetComponent<CApplicationPlayer>();
+  const BOOL playing = player && player->IsPlayingVideo();
+  const BOOL paused = !playing || player->IsPausedPlayback() || player->IsCaching() || m_audioPolicy.IsInterrupted();
+  time_t start;
+  int64_t current, minimum, maximum;
+  CServiceBroker::GetDataCacheCore().GetPlayTimes(start, current, minimum, maximum);
+  if (m_pipTimebase)
+  {
+    const double rate = paused ? 0.0 : player->GetPlaySpeed();
+    const CMTime time = CMTimeMake(current, 1000);
+    if (fabs(CMTimeGetSeconds(CMTimeSubtract(CMTimebaseGetTime(m_pipTimebase), time))) > 0.25)
+      CMTimebaseSetTime(m_pipTimebase, time);
+    CMTimebaseSetRate(m_pipTimebase, rate);
+  }
+  if (m_pipStatePaused != paused || m_pipStateMaximum != maximum ||
+      m_pipStateSession != m_hdrPresentedSession)
+  {
+    m_pipStatePaused = paused;
+    m_pipStateMaximum = maximum;
+    m_pipStateSession = m_hdrPresentedSession;
+    [m_pipController invalidatePlaybackState];
+  }
+  m_pipController.requiresLinearPlayback = !playing || !player->CanSeek() || maximum <= minimum;
+  m_foldPiP.enabled = playing && (m_pipController.pictureInPicturePossible || pipActive.load());
+}
+
+- (void)togglePictureInPicture:(UIButton*)sender
+{
+  [self updatePictureInPictureState];
+  if (m_pipController.pictureInPictureActive)
+    [m_pipController stopPictureInPicture];
+  else if (m_pipController.pictureInPicturePossible)
+    [m_pipController startPictureInPicture];
+}
+
+- (void)pictureInPictureControllerWillStartPictureInPicture:(AVPictureInPictureController*)controller
+{
+  pipActive = true;
+  m_restoringPiP = NO;
+  [self updatePictureInPictureState];
+}
+
+- (void)pictureInPictureControllerDidStartPictureInPicture:(AVPictureInPictureController*)controller
+{
+  CLog::Log(LOGINFO, "iOS PiP: started native video presentation");
+  [self updatePictureInPictureState];
+}
+
+- (void)pictureInPictureController:(AVPictureInPictureController*)controller
+    failedToStartPictureInPictureWithError:(NSError*)error
+{
+  pipActive = false;
+  CLog::Log(LOGWARNING, "iOS PiP: start failed ({})", static_cast<long>(error.code));
+  [self updatePictureInPictureState];
+}
+
+- (void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController*)controller
+{
+  pipActive = false;
+  // Closing the floating player in another app is an explicit stop request.
+  // Restoring its interface is a different transition and must keep playing.
+  if (!m_restoringPiP && self.view.window.windowScene.activationState == UISceneActivationStateBackground &&
+      IOSNativeVideoRenderingActive())
+  {
+    m_audioPolicy.UserCommand();
+    CServiceBroker::GetAppMessenger()->PostMsg(TMSG_MEDIA_PAUSE_IF_PLAYING);
+  }
+  m_restoringPiP = NO;
+  [self.view setNeedsLayout];
+  [self updatePictureInPictureState];
+  CLog::Log(LOGINFO, "iOS PiP: stopped native video presentation");
+}
+
+- (void)pictureInPictureController:(AVPictureInPictureController*)controller
+    restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:(void (^)(BOOL))completionHandler
+{
+  m_restoringPiP = YES;
+  [self.view setNeedsLayout];
+  [self.view layoutIfNeeded];
+  CServiceBroker::GetAppMessenger()->PostMsg(TMSG_EXECUTE_BUILT_IN, -1, -1, nullptr,
+      "ActivateWindow(fullscreenvideo)");
+  completionHandler(YES);
+}
+
+- (void)pictureInPictureController:(AVPictureInPictureController*)controller setPlaying:(BOOL)playing
+{
+  m_audioPolicy.UserCommand();
+  if (playing && m_audioPolicy.IsInterrupted()) return;
+  NSError* error = nil;
+  if (playing && ![[AVAudioSession sharedInstance] setActive:YES error:&error]) return;
+  CServiceBroker::GetAppMessenger()->PostMsg(playing ? TMSG_MEDIA_UNPAUSE : TMSG_MEDIA_PAUSE_IF_PLAYING);
+  if (m_pipTimebase) CMTimebaseSetRate(m_pipTimebase, playing ? 1 : 0);
+  [controller invalidatePlaybackState];
+}
+
+- (BOOL)pictureInPictureControllerIsPlaybackPaused:(AVPictureInPictureController*)controller
+{
+  if (!m_glView.isXBMCAlive) return YES;
+  const auto player = CServiceBroker::GetAppComponents().GetComponent<CApplicationPlayer>();
+  return !player || !player->IsPlayingVideo() || player->IsPausedPlayback() ||
+         player->IsCaching() || m_audioPolicy.IsInterrupted();
+}
+
+- (CMTimeRange)pictureInPictureControllerTimeRangeForPlayback:(AVPictureInPictureController*)controller
+{
+  if (!m_glView.isXBMCAlive) return kCMTimeRangeInvalid;
+  const auto player = CServiceBroker::GetAppComponents().GetComponent<CApplicationPlayer>();
+  if (!player || !player->IsPlayingVideo()) return kCMTimeRangeInvalid;
+  time_t start;
+  int64_t current, minimum, maximum;
+  CServiceBroker::GetDataCacheCore().GetPlayTimes(start, current, minimum, maximum);
+  if (!player->CanSeek() || maximum <= minimum)
+    return CMTimeRangeMake(kCMTimeZero, kCMTimePositiveInfinity);
+  // The API requires the current timebase time to remain inside the range,
+  // including the small interval between a DVR-window update and this query.
+  const int64_t timebase = m_pipTimebase ? CMTimeConvertScale(CMTimebaseGetTime(m_pipTimebase), 1000,
+      kCMTimeRoundingMethod_Default).value : current;
+  minimum = std::min(minimum, timebase);
+  maximum = std::max(maximum, timebase + 1);
+  return CMTimeRangeFromTimeToTime(CMTimeMake(minimum, 1000), CMTimeMake(maximum, 1000));
+}
+
+- (void)pictureInPictureController:(AVPictureInPictureController*)controller
+    skipByInterval:(CMTime)interval completionHandler:(void (^)(void))completionHandler
+{
+  const auto player = CServiceBroker::GetAppComponents().GetComponent<CApplicationPlayer>();
+  time_t start;
+  int64_t current, minimum, maximum;
+  CServiceBroker::GetDataCacheCore().GetPlayTimes(start, current, minimum, maximum);
+  if (!player || !player->CanSeek() || maximum <= minimum)
+  {
+    completionHandler();
+    return;
+  }
+  const int64_t target = std::clamp<int64_t>(current + llround(CMTimeGetSeconds(interval) * 1000), minimum, maximum);
+  CServiceBroker::GetAppMessenger()->PostMsg(TMSG_MEDIA_SEEK_TIME, target);
+  // The seek is asynchronous in Kodi. Wait for its clock to reach the target,
+  // with a bounded failure path that always completes AVKit's request.
+  __weak XBMCController* weakSelf = self;
+  const CFTimeInterval deadline = CACurrentMediaTime() + 3;
+  NSTimer* timer = [NSTimer timerWithTimeInterval:0.05 repeats:YES block:^(NSTimer* timer) {
+    XBMCController* owner = weakSelf;
+    time_t start;
+    int64_t now, low, high;
+    CServiceBroker::GetDataCacheCore().GetPlayTimes(start, now, low, high);
+    if (!owner || llabs(now - target) < 1000 || CACurrentMediaTime() >= deadline)
+    {
+      [timer invalidate];
+      if (owner && owner->m_pipTimebase) CMTimebaseSetTime(owner->m_pipTimebase, CMTimeMake(now, 1000));
+      [owner updatePictureInPictureState];
+      completionHandler();
+    }
+  }];
+  [[NSRunLoop mainRunLoop] addTimer:timer forMode:NSRunLoopCommonModes];
+}
+
+- (void)pictureInPictureController:(AVPictureInPictureController*)controller
+    didTransitionToRenderSize:(CMVideoDimensions)newRenderSize
+{
+  // Kodi keeps the selected source quality. Subtitle composition is bounded
+  // to 960x540; no second decoder or full-screen GUI is kept alive for PiP.
+}
+
+- (BOOL)pictureInPictureControllerShouldProhibitBackgroundAudioPlayback:(AVPictureInPictureController*)controller
+{
+  return NO;
+}
+
+- (void)audioInterruptionBegan
+{
+  if (!m_glView.isXBMCAlive || m_audioPolicy.IsInterrupted()) return;
+  const auto player = CServiceBroker::GetAppComponents().GetComponent<CApplicationPlayer>();
+  uint64_t session;
+  {
+    std::lock_guard<std::mutex> lock(hdrMutex);
+    session = hdrActiveSession;
+  }
+  m_audioPolicy.BeginInterruption(player && player->IsPlaying() && !player->IsPausedPlayback(), session);
+  CServiceBroker::GetAppMessenger()->PostMsg(TMSG_MEDIA_PAUSE_IF_PLAYING);
+  [self updatePictureInPictureState];
+}
+
+- (void)audioInterruptionEnded:(BOOL)shouldResume
+{
+  uint64_t session;
+  {
+    std::lock_guard<std::mutex> lock(hdrMutex);
+    session = hdrActiveSession;
+  }
+  const BOOL resume = m_audioPolicy.EndInterruption(shouldResume, session);
+  NSError* error = nil;
+  if (resume && [[AVAudioSession sharedInstance] setActive:YES error:&error])
+  {
+    // RemoteIO may have been stopped by the OS while its cached running flag
+    // remained true. Reopen the sink through AudioEngine before resuming.
+    if (auto* audio = CServiceBroker::GetActiveAE()) audio->DeviceChange();
+    CServiceBroker::GetAppMessenger()->PostMsg(TMSG_MEDIA_UNPAUSE);
+  }
+  [self updatePictureInPictureState];
+}
+
+- (void)audioSessionNotification:(NSNotification*)notification
+{
+  if (![NSThread isMainThread])
+  {
+    __weak XBMCController* weakSelf = self;
+    dispatch_async(dispatch_get_main_queue(), ^{ [weakSelf audioSessionNotification:notification]; });
+    return;
+  }
+  if (!m_glView.isXBMCAlive) return;
+  if (@available(iOS 27.0, *))
+  {
+    if ([notification.name isEqualToString:AVAudioSessionDidBecomeInactiveNotification])
+    {
+      AVAudioSessionDeactivationContext* context = notification.userInfo[AVAudioSessionDeactivationContextKey];
+      if (context.source == AVAudioSessionDeactivationSourceSystem) [self audioInterruptionBegan];
+    }
+    else if ([notification.name isEqualToString:AVAudioSessionResumptionRecommendationNotification])
+    {
+      AVAudioSessionResumptionContext* context = notification.userInfo[AVAudioSessionResumptionContextKey];
+      [self audioInterruptionEnded:context.recommendation == AVAudioSessionResumptionRecommendationShouldResume];
+    }
+  }
+  if ([notification.name isEqualToString:AVAudioSessionInterruptionNotification])
+  {
+    if ([notification.userInfo[AVAudioSessionInterruptionTypeKey] unsignedIntegerValue] == AVAudioSessionInterruptionTypeBegan)
+      [self audioInterruptionBegan];
+    else
+      [self audioInterruptionEnded:([notification.userInfo[AVAudioSessionInterruptionOptionKey] unsignedIntegerValue] &
+          AVAudioSessionInterruptionOptionShouldResume) != 0];
+  }
+  else if ([notification.name isEqualToString:AVAudioSessionRouteChangeNotification])
+  {
+    if ([notification.userInfo[AVAudioSessionRouteChangeReasonKey] unsignedIntegerValue] == AVAudioSessionRouteChangeReasonOldDeviceUnavailable)
+    {
+      m_audioPolicy.UserCommand();
+      CServiceBroker::GetAppMessenger()->PostMsg(TMSG_MEDIA_PAUSE_IF_PLAYING);
+    }
+  }
+  else if ([notification.name isEqualToString:AVAudioSessionMediaServicesWereLostNotification])
+    [self audioInterruptionBegan];
+  else if ([notification.name isEqualToString:AVAudioSessionMediaServicesWereResetNotification])
+  {
+    [[AVAudioSession sharedInstance] setCategory:AVAudioSessionCategoryPlayback error:nil];
+    if (auto* audio = CServiceBroker::GetActiveAE()) audio->DeviceChange();
+    [self audioInterruptionEnded:YES];
+  }
+}
+
 - (void)foldUtilityPressed:(UIButton*)sender
 {
   if (!m_glView.isXBMCAlive)
@@ -1156,6 +1516,7 @@ void ScheduleHDRDelivery()
 {
   if (!m_glView.isXBMCAlive)
     return;
+  m_audioPolicy.UserCommand();
   if (sender == m_foldBackward || sender == m_foldForward)
   {
     CServiceBroker::GetAppMessenger()->PostMsg(TMSG_EXECUTE_BUILT_IN, -1, -1, nullptr,
@@ -1204,6 +1565,7 @@ void ScheduleHDRDelivery()
     return;
   const auto player = CServiceBroker::GetAppComponents().GetComponent<CApplicationPlayer>();
   const bool playing = player && player->IsPlaying();
+  m_foldPiP.enabled = playing && (m_pipController.pictureInPicturePossible || pipActive.load());
   time_t start;
   int64_t current, minimum, maximum;
   CServiceBroker::GetDataCacheCore().GetPlayTimes(start, current, minimum, maximum);
@@ -1420,6 +1782,10 @@ void ScheduleHDRDelivery()
 - (void)dealloc
 {
   [m_foldTimer invalidate];
+  [m_pipTimer invalidate];
+  m_pipController.delegate = nil;
+  [m_pipController stopPictureInPicture];
+  if (m_pipTimebase) CFRelease(m_pipTimebase);
   // stop background task
   [m_networkAutoSuspendTimer invalidate];
   [self enableNetworkAutoSuspend:nil];
@@ -1701,6 +2067,7 @@ void ScheduleHDRDelivery()
     switch (receivedEvent.subtype)
     {
       case UIEventSubtypeRemoteControlTogglePlayPause:
+        m_audioPolicy.UserCommand();
         CServiceBroker::GetAppMessenger()->SendMsg(
             TMSG_GUI_ACTION, WINDOW_INVALID, -1,
             static_cast<void*>(new CAction(ACTION_PLAYER_PLAYPAUSE)));
@@ -1711,6 +2078,7 @@ void ScheduleHDRDelivery()
             static_cast<void*>(new CAction(ACTION_PLAYER_PLAY)));
         break;
       case UIEventSubtypeRemoteControlPause:
+        m_audioPolicy.UserCommand();
         // ACTION_PAUSE sometimes cause unpause, use MediaPauseIfPlaying to make sure pause only
         CServiceBroker::GetAppMessenger()->SendMsg(TMSG_MEDIA_PAUSE_IF_PLAYING);
         break;
@@ -1762,44 +2130,28 @@ void ScheduleHDRDelivery()
 //--------------------------------------------------------------
 - (void)enterBackground
 {
-  PRINT_SIGNATURE();
-  const auto& components = CServiceBroker::GetAppComponents();
-  const auto appPlayer = components.GetComponent<CApplicationPlayer>();
-  if (appPlayer->IsPlaying() && !appPlayer->IsPaused())
-  {
-    m_isPlayingBeforeInactive = YES;
-    CServiceBroker::GetAppMessenger()->SendMsg(TMSG_MEDIA_PAUSE_IF_PLAYING);
-  }
-  CWinSystemIOS* winSystem = dynamic_cast<CWinSystemIOS*>(CServiceBroker::GetWinSystem());
-  winSystem->OnAppFocusChange(false);
+  // Audio/PiP keep their existing player and network session. Losing the
+  // interactive scene is not an audio interruption.
+  [self pauseAnimation];
+  auto* winSystem = dynamic_cast<CWinSystemIOS*>(CServiceBroker::GetWinSystem());
+  if (winSystem) winSystem->OnAppFocusChange(false);
+  [self updatePictureInPictureState];
+  [self rescheduleNetworkAutoSuspend];
 }
 
 - (void)enterForeground
 {
-  PRINT_SIGNATURE();
-  CWinSystemIOS* winSystem = dynamic_cast<CWinSystemIOS*>(CServiceBroker::GetWinSystem());
-  if (winSystem)
-    winSystem->OnAppFocusChange(true);
-  // when we come back, restore playing if we were.
-  if (m_isPlayingBeforeInactive)
-  {
-    CServiceBroker::GetAppMessenger()->SendMsg(TMSG_MEDIA_UNPAUSE);
-    m_isPlayingBeforeInactive = NO;
-  }
+  auto* winSystem = dynamic_cast<CWinSystemIOS*>(CServiceBroker::GetWinSystem());
+  if (winSystem) winSystem->OnAppFocusChange(true);
+  [self updatePictureInPictureState];
+  // Never undo a pause made by the user merely because the scene is active.
 }
 
 - (void)becomeInactive
 {
-  // if we were interrupted, already paused here
-  // else if user background us or lock screen, only pause video here, audio keep playing.
-  const auto& components = CServiceBroker::GetAppComponents();
-  const auto appPlayer = components.GetComponent<CApplicationPlayer>();
-  if (appPlayer->IsPlayingVideo() && !appPlayer->IsPaused())
-  {
-    m_isPlayingBeforeInactive = YES;
-    CServiceBroker::GetAppMessenger()->SendMsg(TMSG_MEDIA_PAUSE_IF_PLAYING);
-  }
-  // check whether we need disable network auto suspend.
+  m_foldSceneActive = NO;
+  [self updateFoldTimer];
+  [self updatePictureInPictureState];
   [self rescheduleNetworkAutoSuspend];
 }
 //--------------------------------------------------------------
@@ -1808,7 +2160,6 @@ void ScheduleHDRDelivery()
   PRINT_SIGNATURE();
 
   m_foldSceneActive = NO;
-  [self resetHDRVideo];
   [self updateFoldTimer];
   [m_glView pauseAnimation];
 }
