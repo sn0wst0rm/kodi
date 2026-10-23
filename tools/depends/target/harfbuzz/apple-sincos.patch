@@ -1,0 +1,11 @@
+--- a/src/OT/glyf/VarCompositeGlyph.hh
++++ b/src/OT/glyf/VarCompositeGlyph.hh
+@@ -180,7 +180,7 @@
+     rotation = rotation * HB_PI;
+     float c;
+     float s;
+-#ifdef HAVE_SINCOSF
++#if defined(HAVE_SINCOSF) && !defined(__APPLE__)
+     sincosf (rotation, &s, &c);
+ #else
+     c = cosf (rotation);

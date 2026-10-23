@@ -1,5 +1,5 @@
 include ../../Makefile.include LIBPNG-VERSION ../../download-files.include
-DEPS = ../../Makefile.include Makefile LIBPNG-VERSION ../../download-files.include
+DEPS = apple-modern.patch ../../Makefile.include Makefile LIBPNG-VERSION ../../download-files.include
 
 # configuration settings
 CMAKE_OPTIONS=-DPNG_SHARED=OFF \
@@ -30,6 +30,7 @@ all: .installed-$(PLATFORM)
 $(PLATFORM): $(DEPS) | $(TARBALLS_LOCATION)/$(ARCHIVE).$(HASH_TYPE)
 	rm -rf $(PLATFORM); mkdir -p $(PLATFORM)/build
 	cd $(PLATFORM); $(ARCHIVE_TOOL) $(ARCHIVE_TOOL_FLAGS) $(TARBALLS_LOCATION)/$(ARCHIVE)
+	cd $(PLATFORM); patch -p1 -i ../apple-modern.patch
 	cd $(PLATFORM)/build; $(CMAKE) $(CMAKE_OPTIONS) ..
 
 .installed-$(PLATFORM): $(PLATFORM)

@@ -219,6 +219,11 @@ bool CWinSystemIOS::SwitchToVideoMode(int width, int height, double refreshrate)
   bool ret = false;
   int screenIdx = GetDisplayIndexFromSettings();
 
+  // Scene geometry, not a physical display mode, determines the internal
+  // drawable. Switching a screen mode here would undo fold/window resizing.
+  if (screenIdx == 0)
+    return true;
+
   //get the mode to pass to the controller
   UIScreenMode *newMode = getModeForResolution(width, height, screenIdx);
 
@@ -251,17 +256,11 @@ bool CWinSystemIOS::GetScreenResolution(int* w, int* h, double* fps, int screenI
   // the device and eagl gives the correct values in all cases.
   if(screenIdx == 0)
   {
-    // at very first start up we cache the internal screen resolution
-    // because when using external screens and need to go back
-    // to internal we are not able to determine the eagl bounds
-    // before we really switched back to internal
-    // but display settings ask for the internal resolution before
-    // switching. So we give the cached values back in that case.
-    if (m_internalTouchscreenResolutionWidth == -1 &&
-        m_internalTouchscreenResolutionHeight == -1)
+    if (![[IOSScreenManager sharedInstance] isExternalScreen])
     {
-      m_internalTouchscreenResolutionWidth = [g_xbmcController getScreenSize].width;
-      m_internalTouchscreenResolutionHeight = [g_xbmcController getScreenSize].height;
+      const CGSize size = [g_xbmcController getScreenSize];
+      m_internalTouchscreenResolutionWidth = size.width;
+      m_internalTouchscreenResolutionHeight = size.height;
     }
 
     *w = m_internalTouchscreenResolutionWidth;
@@ -335,10 +334,31 @@ bool CWinSystemIOS::BeginRender()
 {
   bool rtn;
 
-  [g_xbmcController setFramebuffer];
+  if (![g_xbmcController setFramebuffer])
+    return false;
 
   rtn = CRenderSystemGLES::BeginRender();
   return rtn;
+}
+
+void CWinSystemIOS::OnDrawableResized(int width, int height)
+{
+  if (width <= 0 || height <= 0 || (m_nWidth == width && m_nHeight == height))
+    return;
+
+  const bool external = [[IOSScreenManager sharedInstance] isExternalScreen];
+  if (!external)
+  {
+    m_internalTouchscreenResolutionWidth = width;
+    m_internalTouchscreenResolutionHeight = height;
+  }
+  auto& desktop = CDisplaySettings::GetInstance().GetResolutionInfo(RES_DESKTOP);
+  UpdateDesktopResolution(desktop, external ? CONST_EXTERNAL : CONST_TOUCHSCREEN,
+                          width, height, desktop.fRefreshRate, 0);
+  GetGfxContext().ResetOverscan(desktop);
+  [g_xbmcController setGUIInsetsFromMainThread:NO];
+  GetGfxContext().SetVideoResolution(RES_DESKTOP, true);
+  CLog::Log(LOGINFO, "iOS drawable resized to {} x {}", width, height);
 }
 
 bool CWinSystemIOS::EndRender()

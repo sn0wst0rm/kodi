@@ -70,6 +70,8 @@ public:
   bool IsBackgrounded() const { return m_bIsBackgrounded; }
   CVEAGLContext GetEAGLContextObj();
   void MoveToTouchscreen();
+  // Called only by the render thread after reallocating its drawable.
+  void OnDrawableResized(int width, int height);
 
   // winevents override
   bool MessagePump() override;

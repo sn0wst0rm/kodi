@@ -105,8 +105,10 @@ static const CGFloat INPUT_BOX_HEIGHT = 30;
   auto keyboardFrame = [notification.userInfo[UIKeyboardFrameEndUserInfoKey] CGRectValue];
   // although converting isn't really necessary in our case, as the holder view occupies
   // the whole screen, technically it's more correct
+  if (!self.window)
+    return;
   auto convertedFrame = [self convertRect:keyboardFrame
-                      fromCoordinateSpace:UIScreen.mainScreen.coordinateSpace];
+                      fromCoordinateSpace:self.window.windowScene.screen.coordinateSpace];
   self.containerBottomConstraint.constant = CGRectGetMinY(convertedFrame);
   [self layoutIfNeeded];
 }

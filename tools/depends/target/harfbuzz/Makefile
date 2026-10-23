@@ -1,5 +1,5 @@
 include ../../Makefile.include HARFBUZZ-VERSION ../../download-files.include
-DEPS = ../../Makefile.include Makefile HARFBUZZ-VERSION ../../download-files.include
+DEPS = apple-sincos.patch ../../Makefile.include Makefile HARFBUZZ-VERSION ../../download-files.include
 
 MESON_BUILD_TYPE=release
 
@@ -37,6 +37,7 @@ all: .installed-$(PLATFORM)
 $(PLATFORM): $(DEPS) | $(TARBALLS_LOCATION)/$(ARCHIVE).$(HASH_TYPE)
 	rm -rf $(PLATFORM)/*; mkdir -p $(PLATFORM)
 	cd $(PLATFORM); $(ARCHIVE_TOOL) $(ARCHIVE_TOOL_FLAGS) $(TARBALLS_LOCATION)/$(ARCHIVE)
+	cd $(PLATFORM); patch -p1 -i ../apple-sincos.patch
 	cd $(PLATFORM); $(CONFIGURE) . build
 
 $(LIBDYLIB): $(PLATFORM)

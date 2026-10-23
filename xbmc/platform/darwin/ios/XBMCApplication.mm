@@ -15,57 +15,70 @@
 
 #import <AVFoundation/AVAudioSession.h>
 
-@implementation XBMCApplicationDelegate
+// Keep the single Kodi engine alive when UIKit reconnects its scene.
+@interface XBMCSceneDelegate : UIResponder <UIWindowSceneDelegate>
+@property(nonatomic, strong) UIWindow* window;
+@end
+
+@implementation XBMCSceneDelegate
+
+- (void)scene:(UIScene*)scene
+    willConnectToSession:(UISceneSession*)session
+                 options:(UISceneConnectionOptions*)connectionOptions
 {
-  XBMCController* m_xbmcController;
+  if (![scene isKindOfClass:UIWindowScene.class])
+    return;
+
+  self.window = [[UIWindow alloc] initWithWindowScene:(UIWindowScene*)scene];
+  if (g_xbmcController)
+    [g_xbmcController attachToWindow:self.window];
+  else
+  {
+    XBMCController* controller = [[XBMCController alloc] initWithWindow:self.window];
+    [self.window layoutIfNeeded];
+    [controller.view layoutIfNeeded];
+    [controller startAnimation];
+  }
 }
 
-// - iOS6 rotation API - will be called on iOS7 runtime!--------
-// - on iOS7 first application is asked for supported orientation
-// - then the controller of the current view is asked for supported orientation
-// - if both say OK - rotation is allowed
+- (void)sceneWillResignActive:(UIScene*)scene
+{
+  [g_xbmcController pauseAnimation];
+  [g_xbmcController becomeInactive];
+}
+
+- (void)sceneDidBecomeActive:(UIScene*)scene
+{
+  [g_xbmcController resumeAnimation];
+  [g_xbmcController enterForeground];
+}
+
+- (void)sceneDidEnterBackground:(UIScene*)scene
+{
+  if (scene.activationState == UISceneActivationStateBackground)
+    [g_xbmcController enterBackground];
+}
+
+- (void)sceneWillEnterForeground:(UIScene*)scene
+{
+  PRINT_SIGNATURE();
+}
+
+@end
+
+@implementation XBMCApplicationDelegate
+
 - (NSUInteger)application:(UIApplication *)application supportedInterfaceOrientationsForWindow:(UIWindow *)window
 {
-  return [[window rootViewController] supportedInterfaceOrientations];
-}
-
-- (void)applicationWillResignActive:(UIApplication *)application
-{
-  PRINT_SIGNATURE();
-
-  [m_xbmcController pauseAnimation];
-  [m_xbmcController becomeInactive];
-}
-
-- (void)applicationDidBecomeActive:(UIApplication *)application
-{
-  PRINT_SIGNATURE();
-
-  [m_xbmcController resumeAnimation];
-  [m_xbmcController enterForeground];
-}
-
-- (void)applicationDidEnterBackground:(UIApplication *)application
-{
-  PRINT_SIGNATURE();
-
-  if (application.applicationState == UIApplicationStateBackground)
-  {
-    // the app is turn into background, not in by screen lock which has app state inactive.
-    [m_xbmcController enterBackground];
-  }
+  return window.rootViewController ? [window.rootViewController supportedInterfaceOrientations]
+                                   : UIInterfaceOrientationMaskAll;
 }
 
 - (void)applicationWillTerminate:(UIApplication *)application
 {
   PRINT_SIGNATURE();
 
-  [m_xbmcController stopAnimation];
-}
-
-- (void)applicationWillEnterForeground:(UIApplication *)application
-{
-  PRINT_SIGNATURE();
+  [g_xbmcController stopAnimation];
 }
 
 - (void)screenDidConnect:(NSNotification *)aNotification
@@ -101,10 +114,6 @@
   PRINT_SIGNATURE();
 
   [[UIDevice currentDevice] setBatteryMonitoringEnabled:YES];
-  UIScreen *currentScreen = [UIScreen mainScreen];
-
-  m_xbmcController = [[XBMCController alloc] initWithFrame: [currentScreen bounds] withScreen:currentScreen];
-  [m_xbmcController startAnimation];
   [self registerScreenNotifications:YES];
 
   NSError *err = nil;

@@ -97,19 +97,9 @@ public:
       [activityVc setValue:subject forKey:@"subject"];
 
       // make sure that the sharing sheet is displayed on iOS device's screen
-      auto iosDeviceScreen = UIScreen.mainScreen;
-      auto iosDeviceWindow = UIApplication.sharedApplication.keyWindow;
-      if (iosDeviceWindow.screen != iosDeviceScreen)
-      {
-        for (UIWindow* window in UIApplication.sharedApplication.windows)
-        {
-          if (window.screen == iosDeviceScreen)
-          {
-            iosDeviceWindow = window;
-            break;
-          }
-        }
-      }
+      auto iosDeviceWindow = g_xbmcController.view.window;
+      if (!iosDeviceWindow)
+        return;
 
       auto rootVc = iosDeviceWindow.rootViewController;
       [rootVc presentViewController:activityVc animated:YES completion:nil];
@@ -127,6 +117,7 @@ public:
 @interface XBMCController ()
 {
   std::unique_ptr<DebugLogSharingPresenter> m_debugLogSharingPresenter;
+  UIStackView* m_foldControls;
 }
 - (void)rescheduleNetworkAutoSuspend;
 @end
@@ -207,6 +198,21 @@ public:
 {
   return UIInterfaceOrientationMaskLandscape;
 }
+- (BOOL)prefersInterfaceOrientationLocked
+{
+  return YES;
+}
+
+- (BOOL)prefersStatusBarHidden
+{
+  return YES;
+}
+
+- (UIInterfaceOrientation)preferredInterfaceOrientationForPresentation
+{
+  return UIInterfaceOrientationLandscapeRight;
+}
+
 //--------------------------------------------------------------
 - (UIInterfaceOrientation) getOrientation
 {
@@ -562,7 +568,7 @@ public:
   }
 }
 //--------------------------------------------------------------
-- (id)initWithFrame:(CGRect)frame withScreen:(UIScreen *)screen
+- (id)initWithWindow:(UIWindow*)window
 {
   PRINT_SIGNATURE();
   m_screenIdx = 0;
@@ -575,12 +581,6 @@ public:
   m_isPlayingBeforeInactive = NO;
   m_bgTask = UIBackgroundTaskInvalid;
 
-  m_window = [[UIWindow alloc] initWithFrame:frame];
-  [m_window setRootViewController:self];
-  m_window.screen = screen;
-  /* Turn off autoresizing */
-  m_window.autoresizingMask = 0;
-  m_window.autoresizesSubviews = NO;
 
   NSNotificationCenter *center;
   center = [NSNotificationCenter defaultCenter];
@@ -591,11 +591,22 @@ public:
 
   orientation = UIInterfaceOrientationLandscapeLeft;
 
-  [m_window makeKeyAndVisible];
   g_xbmcController = self;
   MPNPInfoManager = [DarwinEmbedNowPlayingInfoManager new];
+  [self attachToWindow:window];
 
   return self;
+}
+//--------------------------------------------------------------
+- (void)attachToWindow:(UIWindow*)window
+{
+  // A reconnected scene reuses the engine and playback state.
+  if (m_window != window)
+    m_window.rootViewController = nil;
+  m_window = window;
+  m_window.autoresizesSubviews = YES;
+  m_window.rootViewController = self;
+  [m_window makeKeyAndVisible];
 }
 //--------------------------------------------------------------
 - (void)loadView
@@ -604,16 +615,103 @@ public:
   self.view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
   self.view.autoresizesSubviews = YES;
 
-  m_glView = [[IOSEAGLView alloc] initWithFrame:self.view.bounds withScreen:UIScreen.mainScreen];
+  m_glView = [[IOSEAGLView alloc] initWithFrame:self.view.bounds withScreen:m_window.windowScene.screen];
   [[IOSScreenManager sharedInstance] setView:m_glView];
   [m_glView setMultipleTouchEnabled:YES];
 
   /* Check if screen is Retina */
-  screenScale = [m_glView getScreenScale:[UIScreen mainScreen]];
+  screenScale = self.traitCollection.displayScale;
 
   [self.view addSubview: m_glView];
 
   [self createGestureRecognizers];
+  self.view.backgroundColor = UIColor.blackColor;
+  m_foldControls = [[UIStackView alloc] init];
+  m_foldControls.axis = UILayoutConstraintAxisHorizontal;
+  m_foldControls.alignment = UIStackViewAlignmentCenter;
+  m_foldControls.distribution = UIStackViewDistributionFillEqually;
+  m_foldControls.spacing = 20;
+  NSArray<NSString*>* symbols = @[@"gobackward", @"playpause.fill", @"goforward", @"stop.fill"];
+  NSArray<NSString*>* labels = @[@"Indietro", @"Riproduci o pausa", @"Avanti", @"Interrompi"];
+  const int actions[] = {ACTION_STEP_BACK, ACTION_PLAYER_PLAYPAUSE, ACTION_STEP_FORWARD, ACTION_STOP};
+  for (NSUInteger i = 0; i < symbols.count; ++i)
+  {
+    UIButton* button = [UIButton buttonWithType:UIButtonTypeSystem];
+    UIButtonConfiguration* configuration = [UIButtonConfiguration tintedButtonConfiguration];
+    configuration.image = [UIImage systemImageNamed:symbols[i]];
+    configuration.baseForegroundColor = UIColor.whiteColor;
+    button.configuration = configuration;
+    button.accessibilityLabel = labels[i];
+    button.tag = actions[i];
+    [button addTarget:self action:@selector(foldControlPressed:) forControlEvents:UIControlEventTouchUpInside];
+    [button.heightAnchor constraintGreaterThanOrEqualToConstant:52].active = YES;
+    [m_foldControls addArrangedSubview:button];
+  }
+  m_foldControls.hidden = YES;
+  [self.view addSubview:m_foldControls];
+}
+//--------------------------------------------------------------
+- (void)foldControlPressed:(UIButton*)sender
+{
+  if (m_glView.isXBMCAlive)
+    CServiceBroker::GetAppMessenger()->PostMsg(TMSG_GUI_ACTION, WINDOW_INVALID, -1,
+        static_cast<void*>(new CAction(static_cast<int>(sender.tag))));
+}
+
+- (void)viewDidLayoutSubviews
+{
+  [super viewDidLayoutSubviews];
+  if ([[IOSScreenManager sharedInstance] isExternalScreen])
+    return;
+  CGRect drawable = self.view.bounds;
+  CGRect controls = CGRectZero;
+  if (@available(iOS 27.1, *))
+  {
+    // Query the actual fold geometry; no device model or hinge-angle guesses.
+    for (UIViewReservedRegion* region in
+         [self.view reservedRegionsOfKind:[UIViewReservedRegionKind divisionRegionKind]])
+    {
+      CGRect fold = CGRectIntersection(region.frame, self.view.bounds);
+      if (region.isActive && !CGRectIsNull(fold) &&
+          fold.size.width > fold.size.height && CGRectGetMinY(fold) > 0 &&
+          CGRectGetMaxY(fold) < CGRectGetHeight(self.view.bounds))
+      {
+        drawable.size.height = CGRectGetMinY(fold);
+        controls = CGRectMake(0, CGRectGetMaxY(fold), CGRectGetWidth(self.view.bounds),
+                              CGRectGetHeight(self.view.bounds) - CGRectGetMaxY(fold));
+        break;
+      }
+    }
+  }
+  m_foldControls.hidden = CGRectIsEmpty(controls);
+  if (!m_foldControls.hidden)
+  {
+    CGRect usable = CGRectIntersection(controls, self.view.safeAreaLayoutGuide.layoutFrame);
+    CGFloat width = MIN(CGRectGetWidth(usable) - 32, 440);
+    m_foldControls.frame = CGRectMake(CGRectGetMidX(usable) - width / 2,
+                                     CGRectGetMidY(usable) - 36, MAX(width, 0), 72);
+  }
+  screenScale = self.traitCollection.displayScale;
+  if (!CGRectEqualToRect(m_glView.frame, drawable))
+    m_glView.frame = drawable;
+  [m_glView resizeFrameBuffer];
+}
+
+- (void)viewSafeAreaInsetsDidChange
+{
+  [super viewSafeAreaInsetsDidChange];
+  [m_glView invalidateGUIInsets];
+  [self.view setNeedsLayout];
+}
+
+- (void)viewWillTransitionToSize:(CGSize)size
+     withTransitionCoordinator:(id<UIViewControllerTransitionCoordinator>)coordinator
+{
+  [super viewWillTransitionToSize:size withTransitionCoordinator:coordinator];
+  [coordinator animateAlongsideTransition:^(id<UIViewControllerTransitionCoordinatorContext> context) {
+    [self.view setNeedsLayout];
+    [self.view layoutIfNeeded];
+  } completion:nil];
 }
 //--------------------------------------------------------------
 -(void)viewDidLoad
@@ -650,6 +748,20 @@ public:
 -(void) viewDidAppear:(BOOL)animated
 {
   [super viewDidAppear:animated];
+
+  if (@available(iOS 16.0, *))
+  {
+    [self setNeedsUpdateOfSupportedInterfaceOrientations];
+    UIWindowSceneGeometryPreferencesIOS* preferences =
+        [[UIWindowSceneGeometryPreferencesIOS alloc] initWithInterfaceOrientations:UIInterfaceOrientationMaskLandscape];
+    [self.view.window.windowScene requestGeometryUpdateWithPreferences:preferences errorHandler:^(NSError* error) {
+      NSLog(@"Kodi landscape preference: %@", error.localizedDescription);
+    }];
+  }
+  [self setNeedsStatusBarAppearanceUpdate];
+  if (@available(iOS 26.0, *))
+    [self setNeedsUpdateOfPrefersInterfaceOrientationLocked];
+
 
   [self becomeFirstResponder];
   [[UIApplication sharedApplication] beginReceivingRemoteControlEvents];
@@ -705,7 +817,7 @@ public:
 //--------------------------------------------------------------
 - (CGRect)fullscreenSubviewFrame
 {
-  return UIEdgeInsetsInsetRect(self.view.bounds, m_window.safeAreaInsets);
+  return UIEdgeInsetsInsetRect(self.view.bounds, self.view.safeAreaInsets);
 }
 //--------------------------------------------------------------
 - (void)onXbmcAlive
@@ -727,28 +839,24 @@ public:
 
   // apply safe area to Kodi GUI
   UIEdgeInsets __block insets;
+  CGFloat __block scale;
   auto getInsets = ^{
-    insets = m_window.safeAreaInsets;
+    insets = m_glView.safeAreaInsets;
+    scale = m_glView.traitCollection.displayScale;
   };
   if (isMainThread)
     getInsets();
   else
     dispatch_sync(dispatch_get_main_queue(), getInsets);
 
-  CLog::Log(LOGDEBUG, "insets: {}\nwindow: {}\nscreen: {}",
-            NSStringFromUIEdgeInsets(insets).UTF8String, m_window.description.UTF8String,
-            m_glView.currentScreen.description.UTF8String);
-  if (UIEdgeInsetsEqualToEdgeInsets(insets, UIEdgeInsetsZero))
-    return;
-
-  auto scale = [m_glView getScreenScale:m_glView.currentScreen];
+  CLog::Log(LOGINFO, "Duo GUI insets left={} top={} right={} bottom={} scale={}", insets.left, insets.top, insets.right, insets.bottom, scale);
   guiInsets = EdgeInsets(insets.left * scale, insets.top * scale, insets.right * scale,
                          insets.bottom * scale);
 }
 //--------------------------------------------------------------
-- (void) setFramebuffer
+- (BOOL) setFramebuffer
 {
-  [m_glView setFramebuffer];
+  return [m_glView setFramebuffer];
 }
 //--------------------------------------------------------------
 - (bool) presentFramebuffer
@@ -761,14 +869,14 @@ public:
   __block CGSize tmp;
   if ([NSThread isMainThread])
   {
-    tmp.width  = m_glView.bounds.size.width * screenScale;
-    tmp.height = m_glView.bounds.size.height * screenScale;
+    tmp.width  = m_glView.bounds.size.width * m_glView.traitCollection.displayScale;
+    tmp.height = m_glView.bounds.size.height * m_glView.traitCollection.displayScale;
   }
   else
   {
     dispatch_sync(dispatch_get_main_queue(), ^{
-      tmp.width  = m_glView.bounds.size.width * screenScale;
-      tmp.height = m_glView.bounds.size.height * screenScale;
+      tmp.width  = m_glView.bounds.size.width * m_glView.traitCollection.displayScale;
+      tmp.height = m_glView.bounds.size.height * m_glView.traitCollection.displayScale;
     });
   }
   screensize = tmp;
