@@ -46,6 +46,7 @@
 #import "platform/darwin/NSLogDebugHelpers.h"
 #import "platform/darwin/ios-common/DarwinEmbedNowPlayingInfoManager.h"
 #import "platform/darwin/ios/IOSEAGLView.h"
+#include "platform/darwin/ios/IOSHDRVideo.h"
 #import "platform/darwin/ios/IOSScreenManager.h"
 #import "platform/darwin/ios/XBMCApplication.h"
 
@@ -55,9 +56,12 @@
 
 #include <math.h>
 #include <algorithm>
+#include <mutex>
 #include <signal.h>
 
 #import <AVFoundation/AVAudioSession.h>
+#import <AVFoundation/AVSampleBufferDisplayLayer.h>
+#import <AVFoundation/AVSampleBufferVideoRenderer.h>
 #include <sys/resource.h>
 
 #ifndef M_PI
@@ -66,6 +70,84 @@
 #define RADIANS_TO_DEGREES(radians) ((radians) * (180.0 / M_PI))
 
 XBMCController *g_xbmcController;
+
+namespace
+{
+struct IOSHDRFrame
+{
+  IOSHDRFrame(CVPixelBufferRef image) : buffer(CVPixelBufferRetain(image)) {}
+  ~IOSHDRFrame() { CVPixelBufferRelease(buffer); }
+  CVPixelBufferRef buffer;
+  uint64_t session{0};
+  IOSHDRVideoMetadata metadata;
+  CGRect source;
+  CGRect destination;
+  unsigned int orientation{0};
+};
+
+// A single latest-frame slot bounds both retained decoder surfaces and UIKit
+// work when its thread is busy. No render/graphics lock waits on the main queue.
+std::mutex hdrMutex;
+std::shared_ptr<IOSHDRFrame> hdrPendingFrame;
+uint64_t hdrSessionCounter{0};
+uint64_t hdrActiveSession{0};
+bool hdrDeliveryScheduled{false};
+void ScheduleHDRDelivery(); // caller holds hdrMutex
+}
+
+bool IOSSupportsHDRVideo()
+{
+  if (@available(iOS 17.0, *))
+    return true;
+  return false;
+}
+
+bool IOSIsTenBitVideo(CVPixelBufferRef buffer)
+{
+  if (!buffer)
+    return false;
+  OSType format = CVPixelBufferGetPixelFormatType(buffer);
+  return format == kCVPixelFormatType_420YpCbCr10BiPlanarVideoRange ||
+         format == kCVPixelFormatType_420YpCbCr10BiPlanarFullRange;
+}
+
+uint64_t IOSBeginHDRVideo()
+{
+  std::lock_guard<std::mutex> lock(hdrMutex);
+  hdrActiveSession = ++hdrSessionCounter;
+  hdrPendingFrame.reset();
+  ScheduleHDRDelivery();
+  return hdrActiveSession;
+}
+
+void IOSPresentHDRVideo(uint64_t session, CVPixelBufferRef buffer,
+                        const IOSHDRVideoMetadata& metadata, CGRect source, CGRect destination,
+                        unsigned int orientation)
+{
+  if (!session || !buffer || CGRectIsEmpty(source) || CGRectIsEmpty(destination))
+    return;
+  auto frame = std::make_shared<IOSHDRFrame>(buffer);
+  frame->session = session;
+  frame->metadata = metadata;
+  frame->source = source;
+  frame->destination = destination;
+  frame->orientation = orientation;
+  std::lock_guard<std::mutex> lock(hdrMutex);
+  if (session != hdrActiveSession)
+    return;
+  hdrPendingFrame = std::move(frame);
+  ScheduleHDRDelivery();
+}
+
+void IOSEndHDRVideo(uint64_t session)
+{
+  std::lock_guard<std::mutex> lock(hdrMutex);
+  if (!session || session != hdrActiveSession)
+    return;
+  hdrActiveSession = 0;
+  hdrPendingFrame.reset();
+  ScheduleHDRDelivery();
+}
 
 // Resolve the current dialog on Kodi's GUI thread, including taps made while
 // a modal dialog is running. Never take the graphics lock on UIKit's thread.
@@ -173,11 +255,45 @@ public:
   BOOL m_hasActiveFold;
   BOOL m_foldPostureConfirmed;
   UIInterfaceOrientation m_lastLandscapeOrientation;
+  UIView* m_hdrCanvas;
+  UIView* m_hdrCrop;
+  AVSampleBufferDisplayLayer* m_hdrLayer;
+  std::shared_ptr<IOSHDRFrame> m_hdrDisplayedFrame;
+  std::shared_ptr<IOSHDRFrame> m_hdrEnqueuedFrame;
+  uint64_t m_hdrPresentedSession;
+  CFTimeInterval m_hdrStartedAt;
+  BOOL m_hdrReported;
+  BOOL m_hdrFailed;
 }
 - (void)rescheduleNetworkAutoSuspend;
 - (void)updateFoldPlaybackState;
 - (void)updateFoldTimer;
+- (void)displayHDRFrame:(const std::shared_ptr<IOSHDRFrame>&)frame;
+- (void)layoutHDRVideo;
+- (void)resetHDRVideo;
 @end
+
+namespace
+{
+void ScheduleHDRDelivery()
+{
+  if (hdrDeliveryScheduled)
+    return;
+  hdrDeliveryScheduled = true;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    std::shared_ptr<IOSHDRFrame> frame;
+    {
+      std::lock_guard<std::mutex> lock(hdrMutex);
+      frame = std::move(hdrPendingFrame);
+      hdrDeliveryScheduled = false;
+    }
+    if (frame)
+      [g_xbmcController displayHDRFrame:frame];
+    else
+      [g_xbmcController resetHDRVideo];
+  });
+}
+}
 
 @interface UIApplication (extended)
 -(void) terminateWithSuccess;
@@ -193,6 +309,183 @@ public:
 @synthesize m_networkAutoSuspendTimer;
 @synthesize MPNPInfoManager;
 @synthesize nativeKeyboardActive;
+
+- (void)resetHDRVideo
+{
+  if (@available(iOS 17.0, *))
+    [m_hdrLayer.sampleBufferRenderer flushWithRemovalOfDisplayedImage:YES completionHandler:nil];
+  m_hdrCanvas.hidden = YES;
+  m_hdrDisplayedFrame.reset();
+  m_hdrEnqueuedFrame.reset();
+  m_hdrPresentedSession = 0;
+  m_hdrFailed = NO;
+  m_glView.opaque = YES;
+  m_glView.layer.opaque = YES;
+}
+
+- (void)layoutHDRVideo
+{
+  if (!m_hdrDisplayedFrame || !m_hdrCanvas)
+    return;
+  [CATransaction begin];
+  [CATransaction setDisableActions:YES];
+  if (m_hdrCanvas.superview != m_glView.superview)
+    [m_glView.superview insertSubview:m_hdrCanvas belowSubview:m_glView];
+  m_hdrCanvas.transform = CGAffineTransformIdentity;
+  m_hdrCanvas.bounds = m_glView.bounds;
+  m_hdrCanvas.center = m_glView.center;
+  m_hdrCanvas.transform = m_glView.transform;
+  const auto& frame = *m_hdrDisplayedFrame;
+  CGRect dest = frame.destination;
+  CGSize canvas = m_glView.bounds.size;
+  m_hdrCrop.frame = CGRectMake(dest.origin.x * canvas.width, dest.origin.y * canvas.height,
+                               dest.size.width * canvas.width, dest.size.height * canvas.height);
+  CGRect source = frame.source;
+  switch (frame.orientation % 360)
+  {
+    case 90:
+      source = CGRectMake(1 - CGRectGetMaxY(source), source.origin.x,
+                          source.size.height, source.size.width);
+      break;
+    case 180:
+      source.origin = CGPointMake(1 - CGRectGetMaxX(source), 1 - CGRectGetMaxY(source));
+      break;
+    case 270:
+      source = CGRectMake(source.origin.y, 1 - CGRectGetMaxX(source),
+                          source.size.height, source.size.width);
+      break;
+  }
+  CGSize full = CGSizeMake(m_hdrCrop.bounds.size.width / source.size.width,
+                           m_hdrCrop.bounds.size.height / source.size.height);
+  BOOL quarterTurn = (frame.orientation % 180) != 0;
+  m_hdrLayer.bounds = CGRectMake(0, 0, quarterTurn ? full.height : full.width,
+                                quarterTurn ? full.width : full.height);
+  m_hdrLayer.position = CGPointMake((0.5 - source.origin.x) * full.width,
+                                    (0.5 - source.origin.y) * full.height);
+  m_hdrLayer.affineTransform = CGAffineTransformMakeRotation(frame.orientation * M_PI / 180.0);
+  [CATransaction commit];
+}
+
+- (void)displayHDRFrame:(const std::shared_ptr<IOSHDRFrame>&)frame
+{
+  if (@available(iOS 17.0, *))
+  {
+    if (!m_foldSceneActive || !m_glView.window)
+      return;
+    {
+      std::lock_guard<std::mutex> lock(hdrMutex);
+      if (frame->session != hdrActiveSession)
+        return;
+    }
+    if (m_hdrPresentedSession != frame->session)
+    {
+      [self resetHDRVideo];
+      m_hdrPresentedSession = frame->session;
+      m_hdrStartedAt = CACurrentMediaTime();
+      m_hdrReported = NO;
+    }
+    if (!m_hdrCanvas)
+    {
+      m_hdrCanvas = [[UIView alloc] init];
+      m_hdrCanvas.userInteractionEnabled = NO;
+      m_hdrCanvas.clipsToBounds = YES;
+      m_hdrCrop = [[UIView alloc] init];
+      m_hdrCrop.userInteractionEnabled = NO;
+      m_hdrCrop.clipsToBounds = YES;
+      [m_hdrCanvas addSubview:m_hdrCrop];
+      [m_glView.superview insertSubview:m_hdrCanvas belowSubview:m_glView];
+      m_hdrLayer = [[AVSampleBufferDisplayLayer alloc] init];
+      m_hdrLayer.videoGravity = AVLayerVideoGravityResize;
+      if (@available(iOS 26.0, *))
+        m_hdrLayer.preferredDynamicRange = CADynamicRangeHigh;
+      else
+        m_hdrLayer.wantsExtendedDynamicRangeContent = YES;
+      [m_hdrCrop.layer addSublayer:m_hdrLayer];
+    }
+    bool sameImage = m_hdrEnqueuedFrame && m_hdrEnqueuedFrame->buffer == frame->buffer;
+    m_hdrDisplayedFrame = frame;
+    [self layoutHDRVideo];
+    auto* renderer = m_hdrLayer.sampleBufferRenderer;
+    if (renderer.status == AVQueuedSampleBufferRenderingStatusFailed ||
+        renderer.requiresFlushToResumeDecoding)
+    {
+      if (!m_hdrFailed)
+        CLog::Log(LOGWARNING, "iOS HDR: resetting video renderer after error {}",
+                  static_cast<long>(renderer.error.code));
+      m_hdrFailed = YES;
+      [renderer flush];
+      sameImage = false;
+    }
+    if (!sameImage && renderer.readyForMoreMediaData)
+    {
+      CVPixelBufferRef pixel = frame->buffer;
+      const auto& metadata = frame->metadata;
+      const auto setMissing = [pixel](CFStringRef key, CFTypeRef value) {
+        if (value && !CVBufferHasAttachment(pixel, key))
+          CVBufferSetAttachment(pixel, key, value, kCVAttachmentMode_ShouldPropagate);
+      };
+      // Preserve per-frame metadata already propagated by VideoToolbox,
+      // including Dolby Vision. Fill missing colour/HDR10 signalling only.
+      setMissing(kCVImageBufferColorPrimariesKey,
+                 CVColorPrimariesGetStringForIntegerCodePoint(metadata.primaries));
+      setMissing(kCVImageBufferTransferFunctionKey,
+                 CVTransferFunctionGetStringForIntegerCodePoint(metadata.transfer));
+      setMissing(kCVImageBufferYCbCrMatrixKey,
+                 CVYCbCrMatrixGetStringForIntegerCodePoint(metadata.matrix));
+      if (metadata.hasMastering)
+      {
+        CFDataRef data = CFDataCreate(nullptr, metadata.mastering.data(), metadata.mastering.size());
+        setMissing(kCVImageBufferMasteringDisplayColorVolumeKey, data);
+        CFRelease(data);
+      }
+      if (metadata.hasLight)
+      {
+        CFDataRef data = CFDataCreate(nullptr, metadata.light.data(), metadata.light.size());
+        setMissing(kCVImageBufferContentLightLevelInfoKey, data);
+        CFRelease(data);
+      }
+      CMVideoFormatDescriptionRef format = nullptr;
+      CMSampleBufferRef sample = nullptr;
+      OSStatus result = CMVideoFormatDescriptionCreateForImageBuffer(nullptr, pixel, &format);
+      if (result == noErr)
+      {
+        CMSampleTimingInfo timing = {kCMTimeInvalid, kCMTimeZero, kCMTimeInvalid};
+        result = CMSampleBufferCreateReadyWithImageBuffer(nullptr, pixel, format, &timing, &sample);
+        CFRelease(format);
+      }
+      if (result == noErr)
+      {
+        CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(sample, true);
+        CFDictionarySetValue((CFMutableDictionaryRef)CFArrayGetValueAtIndex(attachments, 0),
+                             kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
+        [renderer enqueueSampleBuffer:sample];
+        CFRelease(sample);
+        m_hdrEnqueuedFrame = frame;
+        m_hdrCanvas.hidden = NO;
+        m_glView.opaque = NO;
+        m_glView.layer.opaque = NO;
+      }
+      else if (!m_hdrFailed)
+      {
+        CLog::Log(LOGERROR, "iOS HDR: could not wrap decoded pixel buffer ({})", result);
+        m_hdrFailed = YES;
+      }
+    }
+    if (!m_hdrReported && CACurrentMediaTime() - m_hdrStartedAt >= 3)
+    {
+      UIScreen* screen = m_hdrCanvas.window.windowScene.screen;
+      CLog::Log(LOGINFO,
+          "iOS HDR: native renderer status={}, pixelFormat={:#x}, transfer={}, primaries={}, "
+          "mastering={}, light={}, EDR current={:.2f} potential={:.2f}",
+          static_cast<int>(renderer.status), CVPixelBufferGetPixelFormatType(frame->buffer),
+          frame->metadata.transfer, frame->metadata.primaries,
+          !!CVBufferHasAttachment(frame->buffer, kCVImageBufferMasteringDisplayColorVolumeKey),
+          !!CVBufferHasAttachment(frame->buffer, kCVImageBufferContentLightLevelInfoKey),
+          screen.currentEDRHeadroom, screen.potentialEDRHeadroom);
+      m_hdrReported = YES;
+    }
+  }
+}
 //--------------------------------------------------------------
 - (void) sendKeypressEvent: (XBMC_Event) event
 {
@@ -1042,6 +1335,7 @@ public:
           !m_foldControls.hidden);
   }
   m_glView.center = CGPointMake(CGRectGetMidX(drawable), CGRectGetMidY(drawable));
+  [self layoutHDRVideo];
   [m_glView resizeFrameBuffer];
 }
 
@@ -1458,6 +1752,7 @@ public:
   PRINT_SIGNATURE();
 
   m_foldSceneActive = NO;
+  [self resetHDRVideo];
   [self updateFoldTimer];
   [m_glView pauseAnimation];
 }
@@ -1483,6 +1778,7 @@ public:
   PRINT_SIGNATURE();
 
   m_foldSceneActive = NO;
+  [self resetHDRVideo];
   [self updateFoldTimer];
   [m_glView stopAnimation];
 }

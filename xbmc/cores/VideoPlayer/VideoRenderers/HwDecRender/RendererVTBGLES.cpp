@@ -16,6 +16,7 @@
 #include "utils/GLUtils.h"
 #include "utils/log.h"
 #if defined(TARGET_DARWIN_IOS)
+#include "platform/darwin/ios/IOSHDRVideo.h"
 #include "windowing/ios/WinSystemIOS.h"
 #define WIN_SYSTEM_CLASS CWinSystemIOS
 #elif defined(TARGET_DARWIN_TVOS)
@@ -26,6 +27,8 @@
 #include <CoreVideo/CVBuffer.h>
 #include <CoreVideo/CVPixelBuffer.h>
 #include <OpenGLES/ES2/glext.h>
+#include <algorithm>
+#include <cmath>
 
 CBaseRenderer* CRendererVTB::Create(CVideoBuffer *buffer)
 {
@@ -67,6 +70,9 @@ CRendererVTB::CRendererVTB()
 
 CRendererVTB::~CRendererVTB()
 {
+#if defined(TARGET_DARWIN_IOS)
+  IOSEndHDRVideo(m_hdrSession);
+#endif
   if (m_textureCache)
     CFRelease(m_textureCache);
 
@@ -74,6 +80,70 @@ CRendererVTB::~CRendererVTB()
   {
     DeleteTexture(i);
   }
+}
+
+bool CRendererVTB::Configure(const VideoPicture& picture, float fps, unsigned int orientation)
+{
+#if defined(TARGET_DARWIN_IOS)
+  IOSEndHDRVideo(m_hdrSession);
+  auto* buffer = dynamic_cast<VTB::CVideoBufferVTB*>(picture.videoBuffer);
+  m_nativeHDR = buffer && IOSSupportsHDRVideo() && IOSIsTenBitVideo(buffer->GetPB());
+  m_hdrSession = m_nativeHDR ? IOSBeginHDRVideo() : 0;
+#endif
+  return CLinuxRendererGLES::Configure(picture, fps, orientation);
+}
+
+bool CRendererVTB::ConfigChanged(const VideoPicture& picture)
+{
+#if defined(TARGET_DARWIN_IOS)
+  auto* buffer = dynamic_cast<VTB::CVideoBufferVTB*>(picture.videoBuffer);
+  if ((buffer && IOSIsTenBitVideo(buffer->GetPB())) != m_nativeHDR)
+    return true;
+#endif
+  return CLinuxRendererGLES::ConfigChanged(picture);
+}
+
+void CRendererVTB::UnInit()
+{
+#if defined(TARGET_DARWIN_IOS)
+  IOSEndHDRVideo(m_hdrSession);
+  m_hdrSession = 0;
+#endif
+  CLinuxRendererGLES::UnInit();
+}
+
+bool CRendererVTB::Flush(bool saveBuffers)
+{
+#if defined(TARGET_DARWIN_IOS)
+  IOSEndHDRVideo(m_hdrSession);
+  m_hdrSession = m_nativeHDR ? IOSBeginHDRVideo() : 0;
+#endif
+  return CLinuxRendererGLES::Flush(saveBuffers);
+}
+
+bool CRendererVTB::RenderCapture(int index, CRenderCapture* capture)
+{
+  // A GLES FBO cannot capture the separate system HDR plane.
+  return !m_nativeHDR && CLinuxRendererGLES::RenderCapture(index, capture);
+}
+
+bool CRendererVTB::Supports(ERENDERFEATURE feature) const
+{
+  if (m_nativeHDR && (feature == RENDERFEATURE_BRIGHTNESS ||
+                      feature == RENDERFEATURE_CONTRAST ||
+                      feature == RENDERFEATURE_TONEMAP || feature == RENDERFEATURE_POSTPROCESS))
+    return false; // The system compositor performs HDR display mapping.
+  return CLinuxRendererGLES::Supports(feature);
+}
+
+bool CRendererVTB::Supports(ESCALINGMETHOD method) const
+{
+  return m_nativeHDR ? method == VS_SCALINGMETHOD_LINEAR : CLinuxRendererGLES::Supports(method);
+}
+
+bool CRendererVTB::SupportsMultiPassRendering()
+{
+  return !m_nativeHDR;
 }
 
 void CRendererVTB::ReleaseBuffer(int idx)
@@ -99,6 +169,12 @@ EShaderFormat CRendererVTB::GetShaderFormat()
 
 bool CRendererVTB::LoadShadersHook()
 {
+  if (m_nativeHDR)
+  {
+    m_renderMethod = RENDER_CUSTOM;
+    CLog::Log(LOGINFO, "VTB: native 10-bit HDR video plane with GLES GUI overlay");
+    return true;
+  }
   CLog::Log(LOGINFO, "GL: Using CVBREF render method");
   m_textureTarget = GL_TEXTURE_2D;
   m_renderMethod = RENDER_CUSTOM;
@@ -109,14 +185,109 @@ bool CRendererVTB::LoadShadersHook()
     return false;
   }
 
-  CVReturn ret = CVOpenGLESTextureCacheCreate(kCFAllocatorDefault,
-                                              NULL,
-                                              m_glContext,
-                                              NULL,
-                                              &m_textureCache);
-  if (ret != kCVReturnSuccess)
-    return false;
+  return false;
+}
 
+bool CRendererVTB::RenderHook(int idx)
+{
+#if defined(TARGET_DARWIN_IOS)
+  if (m_nativeHDR)
+  {
+    auto& picture = m_buffers[idx];
+    auto* buffer = dynamic_cast<VTB::CVideoBufferVTB*>(picture.videoBuffer);
+    if (!buffer)
+      return true;
+
+    IOSHDRVideoMetadata metadata;
+    metadata.primaries = picture.m_srcPrimaries;
+    metadata.transfer = picture.m_srcColTransfer;
+    metadata.matrix = picture.m_srcColSpace;
+    const auto write16 = [](uint8_t* out, unsigned int value) {
+      value = std::min(value, 65535u);
+      out[0] = value >> 8;
+      out[1] = value;
+    };
+    const auto write32 = [](uint8_t* out, uint32_t value) {
+      out[0] = value >> 24;
+      out[1] = value >> 16;
+      out[2] = value >> 8;
+      out[3] = value;
+    };
+    const auto quantise = [](AVRational value, double scale) -> uint32_t {
+      return std::llround(std::clamp(av_q2d(value) * scale, 0.0, 4294967295.0));
+    };
+    if (picture.hasDisplayMetadata && picture.displayMetadata.has_primaries &&
+        picture.displayMetadata.has_luminance)
+    {
+      metadata.hasMastering = true;
+      // ISO/IEC 23008-2 D.2.28 stores primaries in G, B, R order.
+      for (int i = 0; i < 3; ++i)
+        for (int j = 0; j < 2; ++j)
+          write16(metadata.mastering.data() + i * 4 + j * 2,
+                  quantise(picture.displayMetadata.display_primaries[(i + 1) % 3][j], 50000));
+      for (int j = 0; j < 2; ++j)
+        write16(metadata.mastering.data() + 12 + j * 2,
+                quantise(picture.displayMetadata.white_point[j], 50000));
+      write32(metadata.mastering.data() + 16, quantise(picture.displayMetadata.max_luminance, 10000));
+      write32(metadata.mastering.data() + 20, quantise(picture.displayMetadata.min_luminance, 10000));
+    }
+    if (picture.hasLightMetadata)
+    {
+      metadata.hasLight = true;
+      write16(metadata.light.data(), picture.lightMetadata.MaxCLL);
+      write16(metadata.light.data() + 2, picture.lightMetadata.MaxFALL);
+    }
+
+    const auto& gfx = CServiceBroker::GetWinSystem()->GetGfxContext();
+    const int width = gfx.GetWidth();
+    const int height = gfx.GetHeight();
+    if (width <= 0 || height <= 0 || m_sourceWidth == 0 || m_sourceHeight == 0)
+      return true;
+    CRect destination = m_destRect;
+    float z = 0;
+    m_renderSystem->Project(destination.x1, destination.y1, z);
+    m_renderSystem->Project(destination.x2, destination.y2, z);
+    CRect viewport;
+    m_renderSystem->GetViewPort(viewport);
+    // Project() includes viewport X but returns Y relative to its top edge.
+    destination.y1 += viewport.y1;
+    destination.y2 += viewport.y1;
+    CGRect source = CGRectMake(m_sourceRect.x1 / m_sourceWidth, m_sourceRect.y1 / m_sourceHeight,
+        m_sourceRect.Width() / m_sourceWidth, m_sourceRect.Height() / m_sourceHeight);
+    IOSPresentHDRVideo(m_hdrSession, buffer->GetPB(), metadata, source,
+        CGRectMake(destination.x1 / width, destination.y1 / height,
+                   destination.Width() / width, destination.Height() / height), m_renderOrientation);
+
+    // Punch a hole only where Kodi would draw video. Later GUI/OSD rendering
+    // remains on top, including subtitles and modal settings dialogs.
+    GLint scissor[4];
+    GLfloat clearColor[4];
+    GLboolean colorMask[4];
+    const GLboolean scissorEnabled = glIsEnabled(GL_SCISSOR_TEST);
+    glGetIntegerv(GL_SCISSOR_BOX, scissor);
+    glGetFloatv(GL_COLOR_CLEAR_VALUE, clearColor);
+    glGetBooleanv(GL_COLOR_WRITEMASK, colorMask);
+    if (scissorEnabled)
+      destination.Intersect(CRect(scissor[0], height - scissor[1] - scissor[3],
+                                 scissor[0] + scissor[2], height - scissor[1]));
+    destination.Intersect(CRect(0, 0, width, height));
+    if (!destination.IsEmpty())
+    {
+      glEnable(GL_SCISSOR_TEST);
+      glScissor(std::lround(destination.x1), std::lround(height - destination.y2),
+                std::lround(destination.Width()), std::lround(destination.Height()));
+      glColorMask(GL_TRUE, GL_TRUE, GL_TRUE, GL_TRUE);
+      glClearColor(0, 0, 0, 0);
+      glClear(GL_COLOR_BUFFER_BIT);
+      glClearColor(clearColor[0], clearColor[1], clearColor[2], clearColor[3]);
+      glColorMask(colorMask[0], colorMask[1], colorMask[2], colorMask[3]);
+      glScissor(scissor[0], scissor[1], scissor[2], scissor[3]);
+      if (!scissorEnabled)
+        glDisable(GL_SCISSOR_TEST);
+    }
+    return true;
+  }
+#endif
   return false;
 }
 
@@ -184,6 +355,9 @@ bool CRendererVTB::UploadTexture(int index)
     return false;
   }
 
+  if (m_nativeHDR)
+    return true;
+
   CVOpenGLESTextureCacheFlush(m_textureCache, 0);
 
   if (renderBuf.m_textureY)
@@ -244,6 +418,8 @@ bool CRendererVTB::UploadTexture(int index)
 
 void CRendererVTB::AfterRenderHook(int idx)
 {
+  if (m_nativeHDR)
+    return;
   CRenderBuffer &renderBuf = m_vtbBuffers[idx];
   if (renderBuf.m_fence && glIsSyncAPPLE(renderBuf.m_fence))
   {

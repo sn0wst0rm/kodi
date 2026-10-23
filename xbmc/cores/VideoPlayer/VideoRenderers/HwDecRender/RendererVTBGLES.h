@@ -22,12 +22,21 @@ public:
   static bool Register();
 
   // Player functions
+  bool Configure(const VideoPicture& picture, float fps, unsigned int orientation) override;
+  bool ConfigChanged(const VideoPicture& picture) override;
+  void UnInit() override;
+  bool Flush(bool saveBuffers) override;
+  bool RenderCapture(int index, CRenderCapture* capture) override;
+  bool Supports(ERENDERFEATURE feature) const override;
+  bool Supports(ESCALINGMETHOD method) const override;
+  bool SupportsMultiPassRendering() override;
   void ReleaseBuffer(int idx) override;
   bool NeedBuffer(int idx) override;
 
 protected:
   // hooks for hw dec renderer
   bool LoadShadersHook() override;
+  bool RenderHook(int idx) override;
   void AfterRenderHook(int idx) override;
   EShaderFormat GetShaderFormat() override;
 
@@ -46,5 +55,7 @@ protected:
   };
   CRenderBuffer m_vtbBuffers[NUM_BUFFERS];
   CVEAGLContext m_glContext;
+  bool m_nativeHDR{false};
+  uint64_t m_hdrSession{0};
 };
 

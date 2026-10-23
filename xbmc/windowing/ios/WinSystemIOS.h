@@ -41,6 +41,7 @@ public:
   bool SetFullScreen(bool fullScreen, RESOLUTION_INFO& res, bool blankOtherDisplays) override;
   void UpdateResolutions() override;
   bool CanDoWindowed() override { return false; }
+  bool SetHDR(const VideoPicture* picture) override;
 
   void ShowOSMouse(bool show) override {}
   bool HasCursor() override;

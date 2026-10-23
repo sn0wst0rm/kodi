@@ -34,6 +34,7 @@
 #include "windowing/WindowSystemFactory.h"
 
 #import "platform/darwin/ios/IOSScreenManager.h"
+#include "platform/darwin/ios/IOSHDRVideo.h"
 #import "platform/darwin/ios/XBMCController.h"
 
 #include <memory>
@@ -60,6 +61,16 @@
 
 using namespace KODI;
 using namespace MESSAGING;
+
+bool CWinSystemIOS::SetHDR(const VideoPicture* picture)
+{
+  if (!picture || !IOSSupportsHDRVideo())
+    return false;
+  auto* buffer = dynamic_cast<VTB::CVideoBufferVTB*>(picture->videoBuffer);
+  return buffer && IOSIsTenBitVideo(buffer->GetPB()) &&
+         (picture->color_transfer == AVCOL_TRC_SMPTE2084 ||
+          picture->color_transfer == AVCOL_TRC_ARIB_STD_B67);
+}
 
 struct CADisplayLinkWrapper
 {

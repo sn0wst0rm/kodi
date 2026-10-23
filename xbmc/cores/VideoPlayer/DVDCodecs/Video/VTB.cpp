@@ -15,6 +15,10 @@
 #include "cores/VideoPlayer/Process/ProcessInfo.h"
 #include "settings/Settings.h"
 #include "settings/SettingsComponent.h"
+#include "utils/log.h"
+#if defined(TARGET_DARWIN_IOS)
+#include "platform/darwin/ios/IOSHDRVideo.h"
+#endif
 
 #include <mutex>
 
@@ -179,10 +183,23 @@ bool CDecoder::Open(AVCodecContext *avctx, AVCodecContext* mainctx, enum AVPixel
     return false;
 
   AVBufferRef *deviceRef =  av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_VIDEOTOOLBOX);
+  if (!deviceRef)
+    return false;
   AVBufferRef *framesRef = av_hwframe_ctx_alloc(deviceRef);
+  av_buffer_unref(&deviceRef);
+  if (!framesRef)
+    return false;
   AVHWFramesContext *framesCtx = (AVHWFramesContext*)framesRef->data;
   framesCtx->format = AV_PIX_FMT_VIDEOTOOLBOX;
   framesCtx->sw_format = AV_PIX_FMT_NV12;
+#if defined(TARGET_DARWIN_IOS)
+  if (IOSSupportsHDRVideo() && (avctx->color_trc == AVCOL_TRC_SMPTE2084 ||
+                              avctx->color_trc == AVCOL_TRC_ARIB_STD_B67))
+  {
+    framesCtx->sw_format = AV_PIX_FMT_P010;
+    CLog::Log(LOGINFO, "VideoToolbox: preserving 10-bit HDR frames for native iOS presentation");
+  }
+#endif
   avctx->hw_frames_ctx = framesRef;
   m_avctx = avctx;
 
