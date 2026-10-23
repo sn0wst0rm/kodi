@@ -7,6 +7,9 @@ trap 'rm -rf "$TEST_OUTPUT"' EXIT
 xcrun --sdk macosx clang++ -O2 -std=c++17 -I "$IOS_DIR" \
   "$TEST_DIR/PlaybackPolicy.cpp" -o "$TEST_OUTPUT/playback-policy"
 "$TEST_OUTPUT/playback-policy"
+xcrun --sdk macosx clang++ -O2 -std=c++17 -I "$IOS_DIR" \
+  "$TEST_DIR/HDRHeadroom.cpp" -o "$TEST_OUTPUT/hdr-headroom"
+"$TEST_OUTPUT/hdr-headroom"
 xcrun --sdk macosx clang++ -O2 -std=c++17 -fobjc-arc -I "$IOS_DIR" \
   "$TEST_DIR/NativeVideoCompositor.mm" "$IOS_DIR/IOSVideoCompositor.mm" \
   -framework Foundation -framework Accelerate -framework CoreVideo -framework CoreGraphics \

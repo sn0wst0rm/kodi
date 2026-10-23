@@ -8,6 +8,7 @@
 #include <CoreGraphics/CGGeometry.h>
 #include <CoreVideo/CVPixelBuffer.h>
 #include <array>
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -29,6 +30,20 @@ struct IOSHDRVideoMetadata
   std::array<uint8_t, 24> mastering{};
   std::array<uint8_t, 4> light{};
 };
+
+inline double IOSHDRContentHeadroom(const IOSHDRVideoMetadata& metadata)
+{
+  // CTA-861.3 MaxCLL is uint16 big-endian nits. ST 2086 maximum luminance
+  // is uint32 big-endian in 0.0001 nits at byte16 (after primaries/white point).
+  // Prefer the actual content peak over the mastering monitor's capability.
+  double peak = metadata.hasLight ? (uint16_t(metadata.light[0]) << 8 | metadata.light[1]) : 0;
+  if (peak <= 0 && metadata.hasMastering)
+    peak = ((uint32_t(metadata.mastering[16]) << 24) |
+            (uint32_t(metadata.mastering[17]) << 16) |
+            (uint32_t(metadata.mastering[18]) << 8) | metadata.mastering[19]) / 10000.0;
+  if (peak <= 0) peak = 1000.0; // conservative PQ/HLG fallback without metadata
+  return std::clamp(peak / 203.0, 1.0, 10000.0 / 203.0);
+}
 
 // Only decoded, IOSurface-backed buffers are passed to AVFoundation. Kodi
 // remains responsible for decode, audio synchronisation and frame scheduling.

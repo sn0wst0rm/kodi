@@ -10,7 +10,6 @@
 
 #include "CompileInfo.h"
 #include "FileItem.h"
-#include "GUIInfoManager.h"
 #include "ServiceBroker.h"
 #include "Util.h"
 #include "application/AppInboundProtocol.h"
@@ -563,7 +562,15 @@ void ScheduleHDRDelivery()
       [self updatePictureInPictureState];
     }
     bool sameImage = m_hdrEnqueuedFrame && m_hdrEnqueuedFrame->buffer == frame->buffer;
+    const bool dynamicRangeChanged = !m_hdrDisplayedFrame ||
+        frame->metadata.transfer != m_hdrDisplayedFrame->metadata.transfer ||
+        frame->metadata.hasLight != m_hdrDisplayedFrame->metadata.hasLight ||
+        frame->metadata.light != m_hdrDisplayedFrame->metadata.light ||
+        frame->metadata.hasMastering != m_hdrDisplayedFrame->metadata.hasMastering ||
+        frame->metadata.mastering != m_hdrDisplayedFrame->metadata.mastering;
     m_hdrDisplayedFrame = frame;
+    if (dynamicRangeChanged)
+      [self applyHDRPreference];
     [self layoutHDRVideo];
     auto* renderer = m_hdrLayer.sampleBufferRenderer;
     if (renderer.status == AVQueuedSampleBufferRenderingStatusFailed ||
@@ -612,14 +619,20 @@ void ScheduleHDRDelivery()
       CLog::Log(LOGINFO,
           "iOS HDR: native renderer status={}, pixelFormat={:#x}, transfer={}, primaries={}, "
           "mastering={}, light={}, EDR current={:.2f} potential={:.2f}, "
-          "scene={:.0f}x{:.0f}, canvas={:.0f}x{:.0f}, tabletop={}",
+          "scene={:.0f}x{:.0f}, canvas={:.0f}x{:.0f}, tabletop={}, "
+          "HDR requested={}, content headroom={:.2f}, pixel transfer={}, brightness={:.2f}, thermal={}",
           static_cast<int>(renderer.status), CVPixelBufferGetPixelFormatType(frame->buffer),
           frame->metadata.transfer, frame->metadata.primaries,
           !!CVBufferHasAttachment(frame->buffer, kCVImageBufferMasteringDisplayColorVolumeKey),
           !!CVBufferHasAttachment(frame->buffer, kCVImageBufferContentLightLevelInfoKey),
           screen.currentEDRHeadroom, screen.potentialEDRHeadroom,
           self.view.bounds.size.width, self.view.bounds.size.height,
-          m_glView.bounds.size.width, m_glView.bounds.size.height, !m_foldControls.hidden);
+          m_glView.bounds.size.width, m_glView.bounds.size.height, !m_foldControls.hidden,
+          [self foldSourceIsHDR] && [self foldHDREnabled],
+          [self foldSourceIsHDR] ? IOSHDRContentHeadroom(frame->metadata) : 1.0,
+          CVTransferFunctionGetIntegerCodePointForString(static_cast<CFStringRef>(
+              CVBufferGetAttachment(frame->buffer, kCVImageBufferTransferFunctionKey, nullptr))),
+          screen.brightness, static_cast<long>(NSProcessInfo.processInfo.thermalState));
       m_hdrReported = YES;
     }
   }
@@ -1307,11 +1320,20 @@ void ScheduleHDRDelivery()
 
 - (void)applyHDRPreference
 {
-  const BOOL enabled = [self foldHDREnabled];
+  const BOOL sourceHDR = [self foldSourceIsHDR];
+  const BOOL enabled = sourceHDR && [self foldHDREnabled];
   if (@available(iOS 26.0, *))
+  {
+    // AVSampleBufferDisplayLayer is not always tagged as HDR automatically.
+    // The range preference alone does not activate EDR for untagged contents.
+    // Keep the source headroom when HDR is off so CoreAnimation can tone-map.
+    m_hdrLayer.contentsHeadroom = sourceHDR ? IOSHDRContentHeadroom(m_hdrDisplayedFrame->metadata) : 1.0;
     m_hdrLayer.preferredDynamicRange = enabled ? CADynamicRangeHigh : CADynamicRangeStandard;
+  }
   else if (@available(iOS 17.0, *))
     m_hdrLayer.wantsExtendedDynamicRangeContent = enabled;
+  m_hdrReported = NO;
+  m_hdrStartedAt = CACurrentMediaTime();
 }
 
 - (void)foldHDRChanged:(UISwitch*)sender
@@ -1334,8 +1356,17 @@ void ScheduleHDRDelivery()
   if (wasOpen != (page != 0))
     PostFoldTask([show = page != 0] {
       const auto player = CServiceBroker::GetAppComponents().GetComponent<CApplicationPlayer>();
-      if (player && player->IsPlayingVideo() && CServiceBroker::GetGUI())
-        CServiceBroker::GetGUI()->GetInfoManager().GetInfoProviders().GetPlayerInfoProvider().SetShowInfo(show);
+      auto* gui = CServiceBroker::GetGUI();
+      if (!gui) return;
+      auto& manager = gui->GetWindowManager();
+      auto* dialog = manager.GetWindow<CGUIDialog>(WINDOW_DIALOG_VIDEO_OSD_SETTINGS);
+      if (show && player && player->IsPlayingVideo())
+      {
+        if (!manager.IsWindowActive(WINDOW_DIALOG_VIDEO_OSD_SETTINGS))
+          manager.ActivateWindow(WINDOW_DIALOG_VIDEO_OSD_SETTINGS);
+      }
+      else if (dialog && manager.IsWindowActive(WINDOW_DIALOG_VIDEO_OSD_SETTINGS))
+        dialog->Close();
     });
   [self renderFoldSettings];
   if (page)
