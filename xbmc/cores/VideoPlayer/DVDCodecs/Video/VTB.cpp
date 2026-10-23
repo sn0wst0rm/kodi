@@ -129,7 +129,14 @@ void CVideoBufferPoolVTB::Return(int id)
 
 IHardwareDecoder* CDecoder::Create(CDVDStreamInfo &hint, CProcessInfo &processInfo, AVPixelFormat fmt)
 {
-#if defined(TARGET_DARWIN_EMBEDDED)
+#if defined(TARGET_DARWIN_IOS)
+  // Live delivery does not imply interlacing. Progressive DASH/HLS streams
+  // can use VideoToolbox just like files. Keep software decoding for known
+  // interlaced input; Decode() also rejects interlaced frames and triggers
+  // FFmpeg's existing hardware-failure fallback if stream hints were missing.
+  if (hint.interlaced)
+    return nullptr;
+#elif defined(TARGET_DARWIN_EMBEDDED)
   // force disable HW acceleration for live streams
   // to avoid absent image issue on interlaced videos
   if (processInfo.IsRealtimeStream())
