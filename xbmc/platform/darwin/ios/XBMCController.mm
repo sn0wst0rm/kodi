@@ -242,7 +242,8 @@ public:
   UIStackView* m_foldControls;
   UISlider* m_foldScrubber;
   UILabel* m_foldElapsed;
-  UILabel* m_foldDuration;
+  UIButton* m_foldDuration;
+  BOOL m_foldShowRemaining;
   UIButton* m_foldPlayPause;
   UIButton* m_foldBackward;
   UIButton* m_foldForward;
@@ -264,6 +265,8 @@ public:
   CFTimeInterval m_hdrStartedAt;
   BOOL m_hdrReported;
   BOOL m_hdrFailed;
+  CGSize m_hdrSceneSize;
+  CGSize m_hdrCanvasSize;
 }
 - (void)rescheduleNetworkAutoSuspend;
 - (void)updateFoldPlaybackState;
@@ -327,6 +330,18 @@ void ScheduleHDRDelivery()
 {
   if (!m_hdrDisplayedFrame || !m_hdrCanvas)
     return;
+  CGSize sceneSize = self.view.bounds.size;
+  CGSize canvasSize = m_glView.bounds.size;
+  if (!CGSizeEqualToSize(sceneSize, m_hdrSceneSize) ||
+      !CGSizeEqualToSize(canvasSize, m_hdrCanvasSize))
+  {
+    // Recheck the actual display after opening/closing the Duo. Let EDR settle
+    // before reporting; a normal per-frame layout must not reset this timer.
+    m_hdrSceneSize = sceneSize;
+    m_hdrCanvasSize = canvasSize;
+    m_hdrStartedAt = CACurrentMediaTime();
+    m_hdrReported = NO;
+  }
   [CATransaction begin];
   [CATransaction setDisableActions:YES];
   if (m_hdrCanvas.superview != m_glView.superview)
@@ -476,12 +491,15 @@ void ScheduleHDRDelivery()
       UIScreen* screen = m_hdrCanvas.window.windowScene.screen;
       CLog::Log(LOGINFO,
           "iOS HDR: native renderer status={}, pixelFormat={:#x}, transfer={}, primaries={}, "
-          "mastering={}, light={}, EDR current={:.2f} potential={:.2f}",
+          "mastering={}, light={}, EDR current={:.2f} potential={:.2f}, "
+          "scene={:.0f}x{:.0f}, canvas={:.0f}x{:.0f}, tabletop={}",
           static_cast<int>(renderer.status), CVPixelBufferGetPixelFormatType(frame->buffer),
           frame->metadata.transfer, frame->metadata.primaries,
           !!CVBufferHasAttachment(frame->buffer, kCVImageBufferMasteringDisplayColorVolumeKey),
           !!CVBufferHasAttachment(frame->buffer, kCVImageBufferContentLightLevelInfoKey),
-          screen.currentEDRHeadroom, screen.potentialEDRHeadroom);
+          screen.currentEDRHeadroom, screen.potentialEDRHeadroom,
+          self.view.bounds.size.width, self.view.bounds.size.height,
+          m_glView.bounds.size.width, m_glView.bounds.size.height, !m_foldControls.hidden);
       m_hdrReported = YES;
     }
   }
@@ -1002,14 +1020,19 @@ void ScheduleHDRDelivery()
   m_foldControls.spacing = 16;
 
   m_foldElapsed = [[UILabel alloc] init];
-  m_foldDuration = [[UILabel alloc] init];
-  for (UILabel* label in @[m_foldElapsed, m_foldDuration])
-  {
-    label.font = [UIFont monospacedDigitSystemFontOfSize:15 weight:UIFontWeightMedium];
-    label.textColor = UIColor.lightGrayColor;
-    label.text = @"--:--";
-  }
-  m_foldDuration.textAlignment = NSTextAlignmentRight;
+  m_foldElapsed.font = [UIFont monospacedDigitSystemFontOfSize:15 weight:UIFontWeightMedium];
+  m_foldElapsed.textColor = UIColor.lightGrayColor;
+  m_foldElapsed.text = @"--:--";
+  m_foldDuration = [UIButton buttonWithType:UIButtonTypeSystem];
+  m_foldDuration.titleLabel.font = m_foldElapsed.font;
+  [m_foldDuration setTitleColor:UIColor.lightGrayColor forState:UIControlStateNormal];
+  [m_foldDuration setTitleColor:UIColor.lightGrayColor forState:UIControlStateDisabled];
+  [m_foldDuration setTitle:@"--:--" forState:UIControlStateNormal];
+  m_foldDuration.contentHorizontalAlignment = UIControlContentHorizontalAlignmentRight;
+  [m_foldDuration.heightAnchor constraintGreaterThanOrEqualToConstant:44].active = YES;
+  m_foldShowRemaining = [NSUserDefaults.standardUserDefaults boolForKey:@"DuoFoldShowRemainingTime"];
+  [m_foldDuration addTarget:self action:@selector(foldToggleDuration:)
+          forControlEvents:UIControlEventTouchUpInside];
   UIStackView* times = [[UIStackView alloc] initWithArrangedSubviews:@[m_foldElapsed, m_foldDuration]];
   times.distribution = UIStackViewDistributionFillEqually;
   [m_foldControls addArrangedSubview:times];
@@ -1152,6 +1175,29 @@ void ScheduleHDRDelivery()
   return [NSString stringWithFormat:@"%02lld:%02lld", seconds / 60, seconds % 60];
 }
 
+- (void)foldToggleDuration:(UIButton*)sender
+{
+  if (!sender.enabled)
+    return;
+  m_foldShowRemaining = !m_foldShowRemaining;
+  [NSUserDefaults.standardUserDefaults setBool:m_foldShowRemaining forKey:@"DuoFoldShowRemainingTime"];
+  [self updateFoldPlaybackState];
+  if (m_foldScrubbing)
+    [self foldScrubChanged:m_foldScrubber];
+}
+
+- (void)updateFoldDurationFrom:(int64_t)minimum to:(int64_t)maximum current:(int64_t)current
+{
+  NSString* title = m_foldShowRemaining
+      ? [@"−" stringByAppendingString:[self foldTimeText:std::max<int64_t>(0, maximum - current)]]
+      : [self foldTimeText:maximum - minimum];
+  [m_foldDuration setTitle:title forState:UIControlStateNormal];
+  m_foldDuration.accessibilityLabel = m_foldShowRemaining ? @"Tempo rimanente" : @"Durata totale";
+  m_foldDuration.accessibilityValue = title;
+  m_foldDuration.accessibilityHint = m_foldShowRemaining
+      ? @"Tocca per mostrare la durata totale" : @"Tocca per mostrare il tempo rimanente";
+}
+
 - (void)updateFoldPlaybackState
 {
   if (!m_glView.isXBMCAlive || m_foldControls.hidden || !m_foldSceneActive)
@@ -1167,6 +1213,7 @@ void ScheduleHDRDelivery()
   m_foldBackward.enabled = canSeek;
   m_foldForward.enabled = canSeek;
   m_foldScrubber.enabled = canSeek;
+  m_foldDuration.enabled = canSeek;
   if (!canSeek)
     m_foldScrubbing = NO;
 
@@ -1189,8 +1236,16 @@ void ScheduleHDRDelivery()
     m_foldScrubber.value = canSeek ? std::clamp<double>(
         double(current - minimum) / double(maximum - minimum), 0, 1) : 0;
     m_foldElapsed.text = playing ? [self foldTimeText:current - minimum] : @"--:--";
-    m_foldDuration.text = canSeek ? [self foldTimeText:maximum - minimum] :
-        (playing ? @"Diretta · non ricercabile" : @"Nessun video");
+    if (canSeek)
+      [self updateFoldDurationFrom:minimum to:maximum current:current];
+    else
+    {
+      NSString* title = playing ? @"Diretta · non ricercabile" : @"Nessun video";
+      [m_foldDuration setTitle:title forState:UIControlStateNormal];
+      m_foldDuration.accessibilityLabel = title;
+      m_foldDuration.accessibilityValue = nil;
+      m_foldDuration.accessibilityHint = nil;
+    }
     m_foldScrubber.accessibilityValue = m_foldElapsed.text;
   }
 }
@@ -1227,6 +1282,7 @@ void ScheduleHDRDelivery()
   const int64_t target = m_foldSeekMinimum +
       std::llround(sender.value * double(m_foldSeekMaximum - m_foldSeekMinimum));
   m_foldElapsed.text = [self foldTimeText:target - m_foldSeekMinimum];
+  [self updateFoldDurationFrom:m_foldSeekMinimum to:m_foldSeekMaximum current:target];
   sender.accessibilityValue = m_foldElapsed.text;
   // VoiceOver adjusts the slider without a touch-down/up sequence.
   if (!sender.tracking && !m_foldScrubbing)
