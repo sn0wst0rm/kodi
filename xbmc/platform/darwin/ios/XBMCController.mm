@@ -15,8 +15,13 @@
 #include "application/AppInboundProtocol.h"
 #include "application/ApplicationComponents.h"
 #include "application/ApplicationPlayer.h"
+#include "cores/DataCacheCore.h"
 #include "filesystem/SpecialProtocol.h"
 #include "guilib/GUIControl.h"
+#include "guilib/GUIComponent.h"
+#include "guilib/GUIDialog.h"
+#include "guilib/GUIWindowManager.h"
+#include "guilib/WindowIDs.h"
 #include "input/actions/Action.h"
 #include "input/actions/ActionIDs.h"
 #include "input/keyboard/XBMC_keysym.h"
@@ -49,6 +54,7 @@
 #undef id
 
 #include <math.h>
+#include <algorithm>
 #include <signal.h>
 
 #import <AVFoundation/AVAudioSession.h>
@@ -60,6 +66,40 @@
 #define RADIANS_TO_DEGREES(radians) ((radians) * (180.0 / M_PI))
 
 XBMCController *g_xbmcController;
+
+// Resolve the current dialog on Kodi's GUI thread, including taps made while
+// a modal dialog is running. Never take the graphics lock on UIKit's thread.
+static void ToggleFoldWindow(int windowId)
+{
+  struct ToggleRequest
+  {
+    KODI::MESSAGING::ThreadMessageCallback message;
+    int window;
+  };
+  auto* request = new ToggleRequest;
+  request->window = windowId;
+  request->message.userptr = request;
+  request->message.callback = [](void* context) {
+    std::unique_ptr<ToggleRequest> request(static_cast<ToggleRequest*>(context));
+    auto* gui = CServiceBroker::GetGUI();
+    if (!gui)
+      return;
+    auto& manager = gui->GetWindowManager();
+    CGUIWindow* window = manager.GetWindow(request->window);
+    if (!window)
+      return;
+    if (manager.IsWindowActive(request->window))
+    {
+      if (window->IsDialog())
+        static_cast<CGUIDialog*>(window)->Close();
+      else
+        manager.PreviousWindow();
+    }
+    else
+      manager.ActivateWindow(request->window);
+  };
+  CServiceBroker::GetAppMessenger()->PostMsg(TMSG_CALLBACK, -1, -1, &request->message);
+}
 
 class DebugLogSharingPresenter : ISettingCallback
 {
@@ -118,10 +158,25 @@ public:
 {
   std::unique_ptr<DebugLogSharingPresenter> m_debugLogSharingPresenter;
   UIStackView* m_foldControls;
+  UISlider* m_foldScrubber;
+  UILabel* m_foldElapsed;
+  UILabel* m_foldDuration;
+  UIButton* m_foldPlayPause;
+  UIButton* m_foldBackward;
+  UIButton* m_foldForward;
+  NSArray<UIButton*>* m_foldPlaybackButtons;
+  NSTimer* m_foldTimer;
+  BOOL m_foldScrubbing;
+  BOOL m_foldSceneActive;
+  int64_t m_foldSeekMinimum;
+  int64_t m_foldSeekMaximum;
   BOOL m_hasActiveFold;
+  BOOL m_foldPostureConfirmed;
   UIInterfaceOrientation m_lastLandscapeOrientation;
 }
 - (void)rescheduleNetworkAutoSuspend;
+- (void)updateFoldPlaybackState;
+- (void)updateFoldTimer;
 @end
 
 @interface UIApplication (extended)
@@ -630,36 +685,283 @@ public:
 
   [self createGestureRecognizers];
   self.view.backgroundColor = UIColor.blackColor;
+  if (@available(iOS 27.1, *))
+  {
+    __weak XBMCController* weakController = self;
+    [self.view addInteraction:[[UIHingeInteraction alloc]
+        initWithUpdateHandler:^(UIHingeInteraction* interaction, UIHingeInteractionUpdate* update) {
+          XBMCController* controller = weakController;
+          if (!controller)
+            return;
+          // The initial callback is authoritative, even before the first
+          // physical fold. A reserved division rect alone is not posture.
+          BOOL partiallyOpen = update.hinge && update.hinge.status == UIHingeStatusPartiallyOpen;
+          if (controller->m_foldPostureConfirmed != partiallyOpen)
+          {
+            controller->m_foldPostureConfirmed = partiallyOpen;
+            [controller.view setNeedsLayout];
+          }
+        }]];
+  }
   m_foldControls = [[UIStackView alloc] init];
-  m_foldControls.axis = UILayoutConstraintAxisHorizontal;
-  m_foldControls.alignment = UIStackViewAlignmentCenter;
-  m_foldControls.distribution = UIStackViewDistributionFillEqually;
-  m_foldControls.spacing = 20;
-  NSArray<NSString*>* symbols = @[@"gobackward", @"playpause.fill", @"goforward", @"stop.fill"];
-  NSArray<NSString*>* labels = @[@"Indietro", @"Riproduci o pausa", @"Avanti", @"Interrompi"];
-  const int actions[] = {ACTION_STEP_BACK, ACTION_PLAYER_PLAYPAUSE, ACTION_STEP_FORWARD, ACTION_STOP};
+  m_foldControls.axis = UILayoutConstraintAxisVertical;
+  m_foldControls.alignment = UIStackViewAlignmentFill;
+  m_foldControls.spacing = 16;
+
+  m_foldElapsed = [[UILabel alloc] init];
+  m_foldDuration = [[UILabel alloc] init];
+  for (UILabel* label in @[m_foldElapsed, m_foldDuration])
+  {
+    label.font = [UIFont monospacedDigitSystemFontOfSize:15 weight:UIFontWeightMedium];
+    label.textColor = UIColor.lightGrayColor;
+    label.text = @"--:--";
+  }
+  m_foldDuration.textAlignment = NSTextAlignmentRight;
+  UIStackView* times = [[UIStackView alloc] initWithArrangedSubviews:@[m_foldElapsed, m_foldDuration]];
+  times.distribution = UIStackViewDistributionFillEqually;
+  [m_foldControls addArrangedSubview:times];
+  [m_foldControls setCustomSpacing:0 afterView:times];
+
+  m_foldScrubber = [[UISlider alloc] init];
+  m_foldScrubber.minimumValue = 0;
+  m_foldScrubber.maximumValue = 1;
+  m_foldScrubber.tintColor = [UIColor colorWithRed:0.05 green:0.65 blue:0.8 alpha:1];
+  m_foldScrubber.accessibilityLabel = @"Posizione di riproduzione";
+  [m_foldScrubber addTarget:self action:@selector(foldScrubBegan:)
+          forControlEvents:UIControlEventTouchDown];
+  [m_foldScrubber addTarget:self action:@selector(foldScrubChanged:)
+          forControlEvents:UIControlEventValueChanged];
+  [m_foldScrubber addTarget:self action:@selector(foldScrubEnded:)
+          forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside];
+  [m_foldScrubber addTarget:self action:@selector(foldScrubCancelled:)
+          forControlEvents:UIControlEventTouchCancel];
+  [m_foldScrubber.heightAnchor constraintEqualToConstant:36].active = YES;
+  [m_foldControls addArrangedSubview:m_foldScrubber];
+
+  UIStackView* transport = [[UIStackView alloc] init];
+  transport.distribution = UIStackViewDistributionFillEqually;
+  transport.spacing = 16;
+  NSArray<NSString*>* symbols = @[@"gobackward.10", @"play.fill", @"goforward.10", @"stop.fill"];
+  NSArray<NSString*>* labels = @[@"−10 s", @"Riproduci", @"+10 s", @"Stop"];
+  const int actions[] = {-10, ACTION_PLAYER_PLAYPAUSE, 10, ACTION_STOP};
+  NSMutableArray<UIButton*>* playbackButtons = [[NSMutableArray alloc] init];
   for (NSUInteger i = 0; i < symbols.count; ++i)
   {
-    UIButton* button = [UIButton buttonWithType:UIButtonTypeSystem];
-    UIButtonConfiguration* configuration = [UIButtonConfiguration tintedButtonConfiguration];
-    configuration.image = [UIImage systemImageNamed:symbols[i]];
-    configuration.baseForegroundColor = UIColor.whiteColor;
-    button.configuration = configuration;
-    button.accessibilityLabel = labels[i];
+    UIButton* button = [self foldButtonWithSymbol:symbols[i] title:labels[i]];
     button.tag = actions[i];
     [button addTarget:self action:@selector(foldControlPressed:) forControlEvents:UIControlEventTouchUpInside];
-    [button.heightAnchor constraintGreaterThanOrEqualToConstant:52].active = YES;
-    [m_foldControls addArrangedSubview:button];
+    [transport addArrangedSubview:button];
+    [playbackButtons addObject:button];
+    if (i == 0) m_foldBackward = button;
+    if (i == 1) m_foldPlayPause = button;
+    if (i == 2) m_foldForward = button;
   }
+  [m_foldControls addArrangedSubview:transport];
+
+  UIStackView* utilities = [[UIStackView alloc] init];
+  utilities.distribution = UIStackViewDistributionFillEqually;
+  utilities.spacing = 16;
+  UIButton* settings = [self foldButtonWithSymbol:@"gearshape" title:@"Impostazioni"];
+  __weak XBMCController* weakSelf = self;
+  settings.menu = [UIMenu menuWithChildren:@[
+    [UIAction actionWithTitle:@"Impostazioni video" image:[UIImage systemImageNamed:@"film"]
+        identifier:nil handler:^(__kindof UIAction* action) {
+          [weakSelf openFoldWindow:WINDOW_DIALOG_VIDEO_OSD_SETTINGS];
+        }],
+    [UIAction actionWithTitle:@"Impostazioni Kodi" image:[UIImage systemImageNamed:@"gearshape"]
+        identifier:nil handler:^(__kindof UIAction* action) {
+          [weakSelf openFoldWindow:WINDOW_SETTINGS_MENU];
+        }]
+  ]];
+  settings.showsMenuAsPrimaryAction = NO;
+  settings.tag = WINDOW_DIALOG_VIDEO_OSD_SETTINGS;
+  settings.accessibilityHint = @"Tocca per le impostazioni video; tieni premuto per le impostazioni Kodi";
+  [settings addTarget:self action:@selector(foldUtilityPressed:)
+      forControlEvents:UIControlEventTouchUpInside];
+  [utilities addArrangedSubview:settings];
+  NSArray<NSString*>* utilitySymbols = @[@"captions.bubble", @"info.circle", @"globe"];
+  NSArray<NSString*>* utilityLabels = @[@"Sottotitoli", @"Info", @"Lingua"];
+  const int windows[] = {WINDOW_DIALOG_SUBTITLE_OSD_SETTINGS, 0, WINDOW_DIALOG_AUDIO_OSD_SETTINGS};
+  for (NSUInteger i = 0; i < utilitySymbols.count; ++i)
+  {
+    UIButton* button = [self foldButtonWithSymbol:utilitySymbols[i] title:utilityLabels[i]];
+    button.tag = windows[i];
+    [button addTarget:self action:@selector(foldUtilityPressed:) forControlEvents:UIControlEventTouchUpInside];
+    [utilities addArrangedSubview:button];
+    [playbackButtons addObject:button];
+  }
+  [m_foldControls addArrangedSubview:utilities];
+  m_foldPlaybackButtons = playbackButtons;
   m_foldControls.hidden = YES;
   [self.view addSubview:m_foldControls];
 }
 //--------------------------------------------------------------
-- (void)foldControlPressed:(UIButton*)sender
+- (UIButton*)foldButtonWithSymbol:(NSString*)symbol title:(NSString*)title
+{
+  UIButton* button = [UIButton buttonWithType:UIButtonTypeSystem];
+  UIButtonConfiguration* configuration = [UIButtonConfiguration tintedButtonConfiguration];
+  configuration.image = [UIImage systemImageNamed:symbol];
+  configuration.preferredSymbolConfigurationForImage =
+      [UIImageSymbolConfiguration configurationWithPointSize:23 weight:UIImageSymbolWeightMedium];
+  configuration.title = title;
+  configuration.imagePlacement = NSDirectionalRectEdgeTop;
+  configuration.imagePadding = 6;
+  configuration.baseForegroundColor = UIColor.whiteColor;
+  configuration.baseBackgroundColor = [UIColor colorWithRed:0.05 green:0.4 blue:0.65 alpha:1];
+  configuration.titleTextAttributesTransformer = ^NSDictionary*(NSDictionary* incoming) {
+    NSMutableDictionary* attributes = [incoming mutableCopy];
+    attributes[NSFontAttributeName] = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+    return attributes;
+  };
+  button.configuration = configuration;
+  button.accessibilityLabel = title;
+  [button.heightAnchor constraintEqualToConstant:68].active = YES;
+  return button;
+}
+
+- (void)openFoldWindow:(int)window
 {
   if (m_glView.isXBMCAlive)
+    ToggleFoldWindow(window);
+}
+
+- (void)foldUtilityPressed:(UIButton*)sender
+{
+  if (!m_glView.isXBMCAlive)
+    return;
+  if (sender.tag)
+    [self openFoldWindow:static_cast<int>(sender.tag)];
+  else
     CServiceBroker::GetAppMessenger()->PostMsg(TMSG_GUI_ACTION, WINDOW_INVALID, -1,
-        static_cast<void*>(new CAction(static_cast<int>(sender.tag))));
+        static_cast<void*>(new CAction(ACTION_SHOW_INFO)));
+}
+
+- (void)foldControlPressed:(UIButton*)sender
+{
+  if (!m_glView.isXBMCAlive)
+    return;
+  if (sender == m_foldBackward || sender == m_foldForward)
+  {
+    CServiceBroker::GetAppMessenger()->PostMsg(TMSG_EXECUTE_BUILT_IN, -1, -1, nullptr,
+        sender == m_foldBackward ? "Seek(-10)" : "Seek(10)");
+    return;
+  }
+  CServiceBroker::GetAppMessenger()->PostMsg(TMSG_GUI_ACTION, WINDOW_INVALID, -1,
+      static_cast<void*>(new CAction(static_cast<int>(sender.tag))));
+}
+
+- (NSString*)foldTimeText:(int64_t)milliseconds
+{
+  const int64_t seconds = std::max<int64_t>(0, milliseconds / 1000);
+  if (seconds >= 3600)
+    return [NSString stringWithFormat:@"%lld:%02lld:%02lld", seconds / 3600,
+        (seconds / 60) % 60, seconds % 60];
+  return [NSString stringWithFormat:@"%02lld:%02lld", seconds / 60, seconds % 60];
+}
+
+- (void)updateFoldPlaybackState
+{
+  if (!m_glView.isXBMCAlive || m_foldControls.hidden || !m_foldSceneActive)
+    return;
+  const auto player = CServiceBroker::GetAppComponents().GetComponent<CApplicationPlayer>();
+  const bool playing = player && player->IsPlaying();
+  time_t start;
+  int64_t current, minimum, maximum;
+  CServiceBroker::GetDataCacheCore().GetPlayTimes(start, current, minimum, maximum);
+  const bool canSeek = playing && player->CanSeek() && maximum > minimum;
+  for (UIButton* button in m_foldPlaybackButtons)
+    button.enabled = playing;
+  m_foldBackward.enabled = canSeek;
+  m_foldForward.enabled = canSeek;
+  m_foldScrubber.enabled = canSeek;
+  if (!canSeek)
+    m_foldScrubbing = NO;
+
+  const BOOL paused = !playing || player->IsPausedPlayback();
+  NSString* playLabel = paused ? @"Riproduci" : @"Pausa";
+  if (![m_foldPlayPause.configuration.title isEqualToString:playLabel])
+  {
+    UIButtonConfiguration* configuration = m_foldPlayPause.configuration;
+    configuration.image = [UIImage systemImageNamed:paused ? @"play.fill" : @"pause.fill"];
+    configuration.title = playLabel;
+    m_foldPlayPause.configuration = configuration;
+    m_foldPlayPause.accessibilityLabel = playLabel;
+  }
+  // Do not move the thumb underneath the user's finger. Snapshot the DVR
+  // bounds at drag start; clamp the resulting target to fresh bounds on release.
+  if (!m_foldScrubbing)
+  {
+    m_foldSeekMinimum = minimum;
+    m_foldSeekMaximum = maximum;
+    m_foldScrubber.value = canSeek ? std::clamp<double>(
+        double(current - minimum) / double(maximum - minimum), 0, 1) : 0;
+    m_foldElapsed.text = playing ? [self foldTimeText:current - minimum] : @"--:--";
+    m_foldDuration.text = canSeek ? [self foldTimeText:maximum - minimum] :
+        (playing ? @"Diretta · non ricercabile" : @"Nessun video");
+    m_foldScrubber.accessibilityValue = m_foldElapsed.text;
+  }
+}
+
+- (void)updateFoldTimer
+{
+  const BOOL shouldRun = m_foldSceneActive && !m_foldControls.hidden;
+  if (!shouldRun)
+  {
+    [m_foldTimer invalidate];
+    m_foldTimer = nil;
+    m_foldScrubbing = NO;
+  }
+  else if (!m_foldTimer)
+  {
+    __weak XBMCController* weakSelf = self;
+    m_foldTimer = [NSTimer timerWithTimeInterval:0.5 repeats:YES block:^(NSTimer* timer) {
+      [weakSelf updateFoldPlaybackState];
+    }];
+    m_foldTimer.tolerance = 0.1;
+    [[NSRunLoop mainRunLoop] addTimer:m_foldTimer forMode:NSRunLoopCommonModes];
+    [self updateFoldPlaybackState];
+  }
+}
+
+- (void)foldScrubBegan:(UISlider*)sender
+{
+  [self updateFoldPlaybackState];
+  m_foldScrubbing = sender.enabled;
+}
+
+- (void)foldScrubChanged:(UISlider*)sender
+{
+  const int64_t target = m_foldSeekMinimum +
+      std::llround(sender.value * double(m_foldSeekMaximum - m_foldSeekMinimum));
+  m_foldElapsed.text = [self foldTimeText:target - m_foldSeekMinimum];
+  sender.accessibilityValue = m_foldElapsed.text;
+  // VoiceOver adjusts the slider without a touch-down/up sequence.
+  if (!sender.tracking && !m_foldScrubbing)
+    [self foldScrubEnded:sender];
+}
+
+- (void)foldScrubEnded:(UISlider*)sender
+{
+  if (m_glView.isXBMCAlive && sender.enabled)
+  {
+    const auto player = CServiceBroker::GetAppComponents().GetComponent<CApplicationPlayer>();
+    time_t start;
+    int64_t current, minimum, maximum;
+    CServiceBroker::GetDataCacheCore().GetPlayTimes(start, current, minimum, maximum);
+    if (player && player->IsPlaying() && player->CanSeek() && maximum > minimum)
+    {
+      const int64_t target = std::clamp<int64_t>(m_foldSeekMinimum +
+          std::llround(sender.value * double(m_foldSeekMaximum - m_foldSeekMinimum)), minimum, maximum);
+      CServiceBroker::GetAppMessenger()->PostMsg(TMSG_MEDIA_SEEK_TIME, target);
+    }
+  }
+  m_foldScrubbing = NO;
+}
+
+- (void)foldScrubCancelled:(UISlider*)sender
+{
+  m_foldScrubbing = NO;
+  [self updateFoldPlaybackState];
 }
 
 - (void)viewDidLayoutSubviews
@@ -676,9 +978,9 @@ public:
     for (UIViewReservedRegion* region in
          [self.view reservedRegionsOfKind:[UIViewReservedRegionKind divisionRegionKind]])
     {
-      hasActiveFold |= region.isActive;
+      hasActiveFold |= m_foldPostureConfirmed && region.isActive;
       CGRect fold = CGRectIntersection(region.frame, self.view.bounds);
-      if (region.isActive && !CGRectIsNull(fold) &&
+      if (m_foldPostureConfirmed && region.isActive && !CGRectIsNull(fold) &&
           fold.size.width > fold.size.height && CGRectGetMinY(fold) > 0 &&
           CGRectGetMaxY(fold) < CGRectGetHeight(self.view.bounds))
       {
@@ -694,10 +996,20 @@ public:
   if (!m_foldControls.hidden)
   {
     CGRect usable = CGRectIntersection(controls, self.view.safeAreaLayoutGuide.layoutFrame);
-    CGFloat width = MIN(CGRectGetWidth(usable) - 32, 440);
-    m_foldControls.frame = CGRectMake(CGRectGetMidX(usable) - width / 2,
-                                     CGRectGetMidY(usable) - 36, MAX(width, 0), 72);
+    if (CGRectIsNull(usable) || CGRectIsEmpty(usable))
+      m_foldControls.hidden = YES;
+    else
+    {
+      CGFloat width = MIN(MAX(CGRectGetWidth(usable) - 40, 0), 640);
+      CGSize fitting = [m_foldControls systemLayoutSizeFittingSize:CGSizeMake(width, 0)
+          withHorizontalFittingPriority:UILayoutPriorityRequired
+          verticalFittingPriority:UILayoutPriorityFittingSizeLevel];
+      m_foldControls.frame = CGRectMake(CGRectGetMidX(usable) - width / 2,
+          MAX(CGRectGetMinY(usable), CGRectGetMidY(usable) - fitting.height / 2),
+          width, fitting.height);
+    }
   }
+  [self updateFoldTimer];
   screenScale = self.traitCollection.displayScale;
   CGSize canvasSize = drawable.size;
   CGAffineTransform canvasTransform = CGAffineTransformIdentity;
@@ -723,9 +1035,11 @@ public:
     m_glView.transform = CGAffineTransformIdentity;
     m_glView.bounds = canvasBounds;
     m_glView.transform = canvasTransform;
-    CLog::Log(LOGINFO, "Duo canvas {}x{}, scene {}x{}, tabletop={}",
-              canvasSize.width, canvasSize.height, self.view.bounds.size.width,
-              self.view.bounds.size.height, !m_foldControls.hidden);
+    // UIKit can lay out the first scene before Kodi has initialized CLog.
+    // Keep startup geometry diagnostics independent of the engine lifecycle.
+    NSLog(@"Duo canvas %.1fx%.1f, scene %.1fx%.1f, tabletop=%d", canvasSize.width,
+          canvasSize.height, self.view.bounds.size.width, self.view.bounds.size.height,
+          !m_foldControls.hidden);
   }
   m_glView.center = CGPointMake(CGRectGetMidX(drawable), CGRectGetMidY(drawable));
   [m_glView resizeFrameBuffer];
@@ -755,6 +1069,7 @@ public:
 //--------------------------------------------------------------
 - (void)dealloc
 {
+  [m_foldTimer invalidate];
   // stop background task
   [m_networkAutoSuspendTimer invalidate];
   [self enableNetworkAutoSuspend:nil];
@@ -1142,6 +1457,8 @@ public:
 {
   PRINT_SIGNATURE();
 
+  m_foldSceneActive = NO;
+  [self updateFoldTimer];
   [m_glView pauseAnimation];
 }
 //--------------------------------------------------------------
@@ -1149,6 +1466,8 @@ public:
 {
   PRINT_SIGNATURE();
 
+  m_foldSceneActive = YES;
+  [self updateFoldTimer];
   [m_glView resumeAnimation];
 }
 //--------------------------------------------------------------
@@ -1163,6 +1482,8 @@ public:
 {
   PRINT_SIGNATURE();
 
+  m_foldSceneActive = NO;
+  [self updateFoldTimer];
   [m_glView stopAnimation];
 }
 
