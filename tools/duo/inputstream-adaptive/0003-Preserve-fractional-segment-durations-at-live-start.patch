@@ -1,0 +1,112 @@
+From d16342f1790c0a2ad269a1e8b097a75916bea133 Mon Sep 17 00:00:00 2001
+From: sn0wst0rm <9982041+sn0wst0rm@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 15:15:27 +0200
+Subject: [PATCH] Preserve fractional segment durations when selecting the live
+ start
+
+Accumulate timeline ticks before rounding to seconds. Rounding each audio
+segment separately selected older audio than video and delayed live startup.
+---
+ src/common/AdaptiveStream.cpp                 |  9 ++++---
+ src/test/TestDASHTree.cpp                     | 23 +++++++++++++++++
+ .../mpd/live_fractional_segments.mpd          | 25 +++++++++++++++++++
+ 3 files changed, 53 insertions(+), 4 deletions(-)
+ create mode 100644 src/test/manifests/mpd/live_fractional_segments.mpd
+
+diff --git a/src/common/AdaptiveStream.cpp b/src/common/AdaptiveStream.cpp
+index 7d1d30f..50affa3 100644
+--- a/src/common/AdaptiveStream.cpp
++++ b/src/common/AdaptiveStream.cpp
+@@ -669,7 +669,7 @@ bool adaptive::AdaptiveStream::start_stream()
+         !m_tree->IsChangingPeriod() && !CSrvBroker::GetKodiProps().IsPlayTimeshift() &&
+         !current_rep_->Timeline().IsEmpty())
+     {
+-      uint64_t totalDurSecs{0};
++      uint64_t totalDuration{0};
+       const uint64_t liveDelaySecs = m_tree->m_liveDelay;
+       const uint32_t timescale = current_rep_->GetTimescale();
+ 
+@@ -681,11 +681,12 @@ bool adaptive::AdaptiveStream::start_stream()
+       for (auto itSeg = current_rep_->Timeline().rbegin(); itSeg != timelineItRend;
+            ++itSeg)
+       {
+-        // Implicit rounding down because managing PTS milliseconds negatively affects segment selection
+-        totalDurSecs += (itSeg->m_endPts - itSeg->startPTS_) / timescale;
++        // Round the accumulated duration, not each segment: fractional audio
++        // segments would otherwise drift behind the video at live startup.
++        totalDuration += itSeg->m_endPts - itSeg->startPTS_;
+         // Dont use >= since if live delay is equal to the segment duration
+         // we may fall too close to the live edge to get new segments from manifest update
+-        if (totalDurSecs > liveDelaySecs)
++        if (totalDuration / timescale > liveDelaySecs)
+         {
+           if (itSeg != timelineItRend)
+           {
+diff --git a/src/test/TestDASHTree.cpp b/src/test/TestDASHTree.cpp
+index d0dfa03..ec35cc5 100644
+--- a/src/test/TestDASHTree.cpp
++++ b/src/test/TestDASHTree.cpp
+@@ -158,6 +158,29 @@ protected:
+   unsigned char buf[16];
+ };
+ 
++TEST_F(DASHTreeAdaptiveStreamTest, LiveStartPreservesFractionalSegmentDurations)
++{
++  OpenTestFile("mpd/live_fractional_segments.mpd");
++  const auto& adpSets = tree->m_currentPeriod->GetAdaptationSets();
++  ASSERT_EQ(adpSets.size(), 3u);
++
++  for (const auto& adp : adpSets)
++  {
++    SetTestStream(NewStream(adp.get()));
++    ASSERT_TRUE(testStream->start_stream());
++    auto* repr = testStream->getRepresentation();
++    ASSERT_TRUE(repr->current_segment_.has_value());
++    const auto* start = repr->GetNextSegment();
++    ASSERT_NE(start, nullptr);
++    const double delay = static_cast<double>(repr->Timeline().GetBack()->m_endPts - start->startPTS_) /
++                         repr->GetTimescale();
++    // Keep the whole-second live-delay margin without losing fractional
++    // durations once per segment (including segments shorter than a second).
++    EXPECT_GE(delay, 17.0);
++    EXPECT_LE(delay, 18.0);
++  }
++}
++
+ TEST_F(DASHTreeTest, CalculateBaseURL)
+ {
+   // No BaseURL tags
+diff --git a/src/test/manifests/mpd/live_fractional_segments.mpd b/src/test/manifests/mpd/live_fractional_segments.mpd
+new file mode 100644
+index 0000000..41fb7cc
+--- /dev/null
++++ b/src/test/manifests/mpd/live_fractional_segments.mpd
+@@ -0,0 +1,25 @@
++<?xml version="1.0" encoding="UTF-8"?>
++<MPD xmlns="urn:mpeg:dash:schema:mpd:2011" type="dynamic"
++     availabilityStartTime="2021-01-01T00:00:00Z" minimumUpdatePeriod="PT2S"
++     suggestedPresentationDelay="PT16S" minBufferTime="PT2S">
++  <Period id="1" start="PT0S">
++    <AdaptationSet mimeType="video/mp4" segmentAlignment="true">
++      <SegmentTemplate timescale="1000" initialization="v-init.mp4" media="v-$Time$.m4s">
++        <SegmentTimeline><S t="100000" d="2000" r="19"/></SegmentTimeline>
++      </SegmentTemplate>
++      <Representation id="v" bandwidth="1000000" width="1920" height="1080" codecs="avc1.640028"/>
++    </AdaptationSet>
++    <AdaptationSet mimeType="audio/mp4" segmentAlignment="true">
++      <SegmentTemplate timescale="1000" initialization="a-init.mp4" media="a-$Time$.m4s">
++        <SegmentTimeline><S t="100000" d="1984" r="19"/></SegmentTimeline>
++      </SegmentTemplate>
++      <Representation id="a" bandwidth="128000" audioSamplingRate="48000" codecs="mp4a.40.2"/>
++    </AdaptationSet>
++    <AdaptationSet mimeType="audio/mp4" segmentAlignment="true" lang="it">
++      <SegmentTemplate timescale="1000" initialization="short-init.mp4" media="short-$Time$.m4s">
++        <SegmentTimeline><S t="100000" d="480" r="79"/></SegmentTimeline>
++      </SegmentTemplate>
++      <Representation id="short" bandwidth="128000" audioSamplingRate="48000" codecs="mp4a.40.2"/>
++    </AdaptationSet>
++  </Period>
++</MPD>
+-- 
+2.54.0 (Apple Git-157)
+

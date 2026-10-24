@@ -1,3 +1,8 @@
+> **iPhone Duo Canary — Kodi 23.0 ALPHA1.** This branch adapts the Duo work to
+> upstream master. [Port details and build instructions](docs/README.iPhone-Duo.txt).
+> The [stable Kodi 21.3 Duo branch](https://github.com/sn0wst0rm/kodi/tree/feature/iphone-duo)
+> remains available. Device validation of the canary is still pending.
+
 ![Kodi Logo](docs/resources/banner.png)
 
 <p align="center">

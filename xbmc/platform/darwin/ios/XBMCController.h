@@ -33,7 +33,6 @@
 
   UIInterfaceOrientation orientation;
 
-  bool m_isPlayingBeforeInactive;
   UIBackgroundTaskIdentifier m_bgTask;
   NSTimer *m_networkAutoSuspendTimer;
   bool nativeKeyboardActive;
@@ -60,8 +59,9 @@
 - (void) observeDefaultCenterStuff: (NSNotification *) notification;
 - (CGRect)fullscreenSubviewFrame;
 - (void)onXbmcAlive;
+- (void)updateOrientationForSceneGeometry;
 - (void)setGUIInsetsFromMainThread:(BOOL)isMainThread;
-- (void) setFramebuffer;
+- (BOOL) setFramebuffer;
 - (bool) presentFramebuffer;
 - (CGSize) getScreenSize;
 - (UIInterfaceOrientation) getOrientation;
@@ -79,7 +79,8 @@
 - (void) enableScreenSaver;
 - (bool) changeScreen: (unsigned int)screenIdx withMode:(UIScreenMode *)mode;
 - (void) activateScreen: (UIScreen *)screen withOrientation:(UIInterfaceOrientation)newOrientation;
-- (id)   initWithFrame:(CGRect)frame withScreen:(UIScreen *)screen;
+- (id)initWithWindow:(UIWindow*)window;
+- (void)attachToWindow:(UIWindow*)window;
 - (CVEAGLContext)getEAGLContextObj;
 @end
 

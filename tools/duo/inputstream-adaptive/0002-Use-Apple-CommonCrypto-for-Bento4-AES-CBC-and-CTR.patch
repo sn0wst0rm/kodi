@@ -1,0 +1,270 @@
+From 27ccb5180a97bf8386c9b400b2dac0d7876fc0d9 Mon Sep 17 00:00:00 2001
+From: sn0wst0rm <9982041+sn0wst0rm@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 04:06:25 +0200
+Subject: [PATCH 2/2] Use Apple CommonCrypto for Bento4 AES CBC and CTR
+
+---
+ .../bento4/0001-apple-commoncrypto-aes.patch  | 107 ++++++++++++++++++
+ tools/tests/README.apple-aes.txt              |  22 ++++
+ tools/tests/apple_aes_compat.cpp              |  74 ++++++++++++
+ tools/tests/test_apple_aes.sh                 |  24 ++++
+ 4 files changed, 227 insertions(+)
+ create mode 100644 depends/common/bento4/0001-apple-commoncrypto-aes.patch
+ create mode 100644 tools/tests/README.apple-aes.txt
+ create mode 100644 tools/tests/apple_aes_compat.cpp
+ create mode 100644 tools/tests/test_apple_aes.sh
+
+diff --git a/depends/common/bento4/0001-apple-commoncrypto-aes.patch b/depends/common/bento4/0001-apple-commoncrypto-aes.patch
+new file mode 100644
+index 0000000..b2caeae
+--- /dev/null
++++ b/depends/common/bento4/0001-apple-commoncrypto-aes.patch
+@@ -0,0 +1,107 @@
++--- a/Source/C++/Crypto/Ap4AesBlockCipher.cpp
+++++ b/Source/C++/Crypto/Ap4AesBlockCipher.cpp
++@@ -40,6 +40,9 @@
++ #include "Ap4Results.h"
++ #include "Ap4Utils.h"
++ #include "Ap4Config.h"
+++#if defined(__APPLE__) && !defined(AP4_DISABLE_COMMONCRYPTO)
+++#include <CommonCrypto/CommonCryptor.h>
+++#endif
++ 
++ /*----------------------------------------------------------------------
++ |   AES types
++@@ -1918,6 +1921,62 @@
++ //    unsigned int m_CounterSize;
++ };
++ 
+++#if defined(__APPLE__) && !defined(AP4_DISABLE_COMMONCRYPTO)
+++/* Use Apple's CPU-dispatched AES implementation. Keep the cryptor/key schedule
+++   for the lifetime of the cipher; only the IV changes between samples/subsamples. */
+++class AP4_AesCommonCryptoBlockCipher : public AP4_AesBlockCipher
+++{
+++public:
+++    AP4_AesCommonCryptoBlockCipher(CipherDirection direction, CipherMode mode,
+++                                  CCCryptorRef cryptor) :
+++        AP4_AesBlockCipher(direction, mode, NULL), m_Cryptor(cryptor) {}
+++    ~AP4_AesCommonCryptoBlockCipher() override { CCCryptorRelease(m_Cryptor); }
+++
+++    AP4_Result Process(const AP4_UI08* input, AP4_Size input_size,
+++                       AP4_UI08* output, const AP4_UI08* iv) override
+++    {
+++        if (m_Mode == CBC && input_size%AP4_AES_BLOCK_SIZE) {
+++            return AP4_ERROR_INVALID_PARAMETERS;
+++        }
+++        if (!input_size) return AP4_SUCCESS;
+++        if (!input || !output) return AP4_ERROR_INVALID_PARAMETERS;
+++        AP4_UI08 counter[AP4_AES_BLOCK_SIZE] = {};
+++        if (iv) AP4_CopyMemory(counter, iv, sizeof(counter));
+++        while (input_size) {
+++            AP4_Size chunk = input_size;
+++            if (m_Mode == CTR) {
+++                // CommonCrypto increments the low 64 bits. Split at overflow
+++                // to preserve Bento4's existing carry into bytes 1..7 as well.
+++                AP4_UI64 low = 0;
+++                for (unsigned int i=8; i<16; ++i) low = (low<<8) | counter[i];
+++                AP4_UI64 blocks = (static_cast<AP4_UI64>(input_size)+15)/16;
+++                if (blocks-1 > (~AP4_UI64(0))-low) {
+++                    chunk = static_cast<AP4_Size>(((~AP4_UI64(0))-low+1)*16);
+++                }
+++            }
+++            size_t written = 0;
+++            if (CCCryptorReset(m_Cryptor, counter) != kCCSuccess ||
+++                CCCryptorUpdate(m_Cryptor, input, chunk, output, chunk, &written) != kCCSuccess ||
+++                written != chunk) {
+++                return AP4_ERROR_INTERNAL;
+++            }
+++            input += chunk;
+++            output += chunk;
+++            input_size -= chunk;
+++            if (input_size) {
+++                AP4_SetMemory(counter+8, 0, 8);
+++                for (int i=7; i>0; --i) {
+++                    if (++counter[i]) break;
+++                }
+++            }
+++        }
+++        return AP4_SUCCESS;
+++    }
+++private:
+++    CCCryptorRef m_Cryptor;
+++};
+++#endif
+++
++ /*----------------------------------------------------------------------
++ |   AP4_AesCtrBlockCipher::Process
++ +---------------------------------------------------------------------*/
++@@ -2119,7 +2178,22 @@
++                            AP4_AesBlockCipher*& cipher)
++ {
++     cipher = NULL;
++-
+++#if defined(__APPLE__) && !defined(AP4_DISABLE_COMMONCRYPTO)
+++    if (!key || (mode != CBC && mode != CTR) ||
+++        (direction != ENCRYPT && direction != DECRYPT)) {
+++        return AP4_ERROR_INVALID_PARAMETERS;
+++    }
+++    CCCryptorRef cryptor = NULL;
+++    // CTR uses the AES encrypt primitive for both cipher directions.
+++    CCCryptorStatus status = CCCryptorCreateWithMode(
+++        mode == CTR || direction == ENCRYPT ? kCCEncrypt : kCCDecrypt,
+++        mode == CTR ? kCCModeCTR : kCCModeCBC, kCCAlgorithmAES, ccNoPadding,
+++        NULL, key, AP4_AES_KEY_LENGTH, NULL, 0, 0,
+++        mode == CTR ? kCCModeOptionCTR_BE : 0, &cryptor);
+++    if (status != kCCSuccess) return AP4_ERROR_INTERNAL;
+++    cipher = new AP4_AesCommonCryptoBlockCipher(direction, mode, cryptor);
+++    return AP4_SUCCESS;
+++#else
++     aes_ctx* context = new aes_ctx();
++ 
++     switch (mode) {
++@@ -2157,6 +2231,7 @@
++     }
++ 
++     return AP4_SUCCESS;
+++#endif
++ }
++ 
++ /*----------------------------------------------------------------------
+diff --git a/tools/tests/README.apple-aes.txt b/tools/tests/README.apple-aes.txt
+new file mode 100644
+index 0000000..c8db2e7
+--- /dev/null
++++ b/tools/tests/README.apple-aes.txt
+@@ -0,0 +1,22 @@
++Apple AES backend validation
++============================
++The internal Bento4 dependency applies 0001-apple-commoncrypto-aes.patch on Apple
++platforms. CBC and CTR use a retained CommonCrypto cryptor with per-call IV reset.
++No keys, licences, or decrypted media are logged. Non-Apple builds retain Bento4's
++original backend. AP4_DISABLE_COMMONCRYPTO exists for the reference test build.
++
++Run on macOS, against the patched Bento4 source downloaded by the add-on build:
++  bash tools/tests/test_apple_aes.sh /path/to/bento4 /tmp/apple-aes-tests
++  SANITIZE=1 bash tools/tests/test_apple_aes.sh /path/to/bento4 /tmp/apple-aes-asan
++
++The test checks NIST SP 800-38A AES-128 CBC/CTR vectors and 5,280 deterministic
++comparisons against the scalar implementation (72,076,256 bytes), including null
++IV, zero/partial blocks, in-place buffers, repeated IV reset, counter carry out of
++the low 64 bits, fragmented input and seek with 8/16-byte stream counters. Invalid
++CBC sizes must fail. Host throughput is not an iPhone energy measurement.
++
++CommonCrypto's platform dispatch selects its AES implementation. Confirm the
++actual phone path with Time Profiler after installation; importing its API alone
++is not a measurement of the phone's energy saving. Apple source/API references:
++https://github.com/apple-oss-distributions/CommonCrypto/blob/main/lib/CommonCryptor.c
++https://developer.apple.com/library/archive/documentation/System/Conceptual/ManPages_iPhoneOS/man3/CCCryptor.3cc.html
+diff --git a/tools/tests/apple_aes_compat.cpp b/tools/tests/apple_aes_compat.cpp
+new file mode 100644
+index 0000000..b84e1f1
+--- /dev/null
++++ b/tools/tests/apple_aes_compat.cpp
+@@ -0,0 +1,74 @@
++// Tests CommonCrypto against the original Bento4 implementation and NIST SP 800-38A.
++#include "Ap4AesBlockCipher.h"
++#include "Ap4StreamCipher.h"
++#include <algorithm>
++#include <array>
++#include <cassert>
++#include <chrono>
++#include <cstdio>
++#include <memory>
++#include <random>
++#include <vector>
++using Bytes=std::vector<AP4_UI08>;
++extern AP4_BlockCipher* CreateSoftwareCipher(const AP4_UI08*, AP4_BlockCipher::CipherDirection, AP4_BlockCipher::CipherMode);
++void AP4_BytesFromUInt64BE(unsigned char* b,AP4_UI64 x) {for(int i=7;i>=0;--i){b[i]=x&255;x>>=8;}}
++Bytes hex(const char* s){Bytes b;for(;*s;s+=2){unsigned v;assert(sscanf(s,"%2x",&v)==1);b.push_back(v);}return b;}
++AP4_BlockCipher* create(const Bytes& key,AP4_BlockCipher::CipherDirection d,AP4_BlockCipher::CipherMode m,bool software=false){
++ if(software)return CreateSoftwareCipher(key.data(),d,m);
++ AP4_AesBlockCipher* c=nullptr;assert(AP4_AesBlockCipher::Create(key.data(),d,m,nullptr,c)==AP4_SUCCESS);return c;
++}
++int main(){
++ using C=AP4_BlockCipher;
++ Bytes key=hex("2b7e151628aed2a6abf7158809cf4f3c");
++ Bytes plain=hex("6bc1bee22e409f96e93d7e117393172aae2d8a571e03ac9c9eb76fac45af8e5130c81c46a35ce411e5fbc1191a0a52eff69f2445df4f9b17ad2b417be66c3710");
++ for(auto m:{C::CTR,C::CBC}){
++  auto iv=hex(m==C::CTR?"f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff":"000102030405060708090a0b0c0d0e0f");
++  auto expected=hex(m==C::CTR?"874d6191b620e3261bef6864990db6ce9806f66b7970fdff8617187bb9fffdff5ae4df3edbd5d35e5b4f09020db03eab1e031dda2fbe03d1792170a0f3009cee":"7649abac8119b246cee98e9b12e9197d5086cb9b507219ee95db113a917678b273bed6b8e3c1743b7116e69e222295163ff1caa1681fac09120eca307586e1a7");
++  for(auto d:{C::ENCRYPT,C::DECRYPT}){
++   std::unique_ptr<C> c(create(key,d,m));auto in=d==C::ENCRYPT?plain:expected;Bytes out(in.size());
++   assert(c->Process(in.data(),in.size(),out.data(),iv.data())==AP4_SUCCESS);assert(out==(d==C::ENCRYPT?expected:plain));
++   assert(c->Process(in.data(),in.size(),in.data(),iv.data())==AP4_SUCCESS);assert(in==out);
++  }
++ }
++ std::mt19937 rng(0x31415926);size_t compared=0,cases=0;
++ for(auto m:{C::CTR,C::CBC})for(auto d:{C::ENCRYPT,C::DECRYPT})for(int k=0;k<8;k++){
++  for(auto& b:key)b=rng();std::unique_ptr<C> c(create(key,d,m)),ref(create(key,d,m,true));
++  for(int n=0;n<160;n++){
++   size_t size=n<128?n:((n-127)*4096+7);if(m==C::CBC)size=size/16*16;
++   Bytes input(size),iv(16),out(size),expected(size);for(auto& b:input)b=rng();for(auto& b:iv)b=rng();
++   // Exercise carry out of the low 64 bits and legacy byte-0 wrap semantics.
++   if(n%3==0){std::fill(iv.begin()+1,iv.end(),255);iv[15]-=n%16;}
++   const auto* ivp=n%7?iv.data():nullptr;
++   assert(c->Process(input.data(),size,out.data(),ivp)==AP4_SUCCESS);
++   assert(ref->Process(input.data(),size,expected.data(),ivp)==AP4_SUCCESS);assert(out==expected);
++   if(size){auto inplace=input;assert(c->Process(inplace.data(),size,inplace.data(),ivp)==AP4_SUCCESS);assert(inplace==expected);}
++   compared+=size;++cases;
++  }
++  if(m==C::CBC){Bytes bad(17);assert(c->Process(bad.data(),bad.size(),bad.data(),nullptr)==AP4_ERROR_INVALID_PARAMETERS);}
++ }
++ for(auto counterSize:{8u,16u}){
++  AP4_CtrStreamCipher c(create(key,C::DECRYPT,C::CTR),counterSize),ref(create(key,C::DECRYPT,C::CTR,true),counterSize);
++  Bytes input(16387),iv(16);for(auto&b:input)b=rng();for(auto&b:iv)b=rng();
++  for(int attempt=0;attempt<80;attempt++){
++   c.SetIV(iv.data());ref.SetIV(iv.data());unsigned offset=rng()%4097;c.SetStreamOffset(offset);ref.SetStreamOffset(offset);
++   Bytes out(input.size()),expected(input.size());size_t pos=0;
++   while(pos<input.size()){
++    AP4_Size size=std::min<size_t>(1+rng()%713,input.size()-pos),written=size,referenceWritten=size;
++    assert(c.ProcessBuffer(input.data()+pos,size,out.data()+pos,&written,false)==AP4_SUCCESS);
++    assert(ref.ProcessBuffer(input.data()+pos,size,expected.data()+pos,&referenceWritten,false)==AP4_SUCCESS);
++    assert(written==size&&referenceWritten==size);pos+=size;
++   }
++   assert(out==expected);compared+=input.size();++cases;
++  }
++ }
++ printf("PASS: NIST CTR/CBC, %zu differential cases, %zu bytes; in-place, reset, null IV, partial blocks, counter carry, fragmented input and seek.\n",cases,compared);
++ Bytes in(65536,19),out(in.size()),iv(16,31);volatile unsigned checksum=0;
++ for(bool software:{true,false}){
++  std::unique_ptr<C> c(create(key,C::DECRYPT,C::CTR,software));auto start=std::chrono::steady_clock::now();
++  constexpr size_t iterations=4096;
++  for(size_t i=0;i<iterations;i++){iv[15]=i;assert(c->Process(in.data(),in.size(),out.data(),iv.data())==AP4_SUCCESS);checksum+=out[i%out.size()];}
++  double seconds=std::chrono::duration<double>(std::chrono::steady_clock::now()-start).count();
++  printf("%s: %.2f MiB/s (256 MiB), %.4f seconds; host throughput, not device energy\n",software?"Bento4 scalar":"Apple CommonCrypto",iterations*in.size()/1048576.0/seconds,seconds);
++ }
++ return checksum==0;
++}
+diff --git a/tools/tests/test_apple_aes.sh b/tools/tests/test_apple_aes.sh
+new file mode 100644
+index 0000000..f27aa06
+--- /dev/null
++++ b/tools/tests/test_apple_aes.sh
+@@ -0,0 +1,24 @@
++#!/bin/bash
++set -euo pipefail
++# Pass the patched Bento4 source directory and a dedicated output directory.
++bento=$(cd "$1" && pwd)
++mkdir -p "$2"
++out=$(cd "$2" && pwd)
++tests=$(cd "$(dirname "$0")" && pwd)
++inc=("-I$bento/Source/C++/Core" "-I$bento/Source/C++/Crypto" "-I$bento/Source/C++/Codecs" "-I$bento/Source/C++/MetaData")
++flags=(-std=c++17 -O3 -g)
++if [[ ${SANITIZE:-0} == 1 ]]; then flags+=(-fsanitize=address,undefined -fno-omit-frame-pointer); fi
++cat > "$out/software.cpp" <<'CPP'
++#define AP4_DISABLE_COMMONCRYPTO 1
++#define AP4_AesBlockCipher AP4_SoftwareAesBlockCipher
++#define AP4_AesCtrBlockCipher AP4_SoftwareAesCtrBlockCipher
++#define AP4_AesCbcBlockCipher AP4_SoftwareAesCbcBlockCipher
++#include "Ap4AesBlockCipher.cpp"
++AP4_BlockCipher* CreateSoftwareCipher(const AP4_UI08* key,AP4_BlockCipher::CipherDirection d,AP4_BlockCipher::CipherMode m){
++ AP4_SoftwareAesBlockCipher* c=nullptr;
++ if(AP4_SoftwareAesBlockCipher::Create(key,d,m,nullptr,c)!=AP4_SUCCESS) return nullptr;
++ return c;
++}
++CPP
++xcrun --sdk macosx clang++ "${flags[@]}" "${inc[@]}" "$tests/apple_aes_compat.cpp" "$out/software.cpp" "$bento/Source/C++/Crypto/Ap4AesBlockCipher.cpp" "$bento/Source/C++/Crypto/Ap4StreamCipher.cpp" -o "$out/test_apple_aes"
++"$out/test_apple_aes"
+-- 
+2.54.0 (Apple Git-157)
+

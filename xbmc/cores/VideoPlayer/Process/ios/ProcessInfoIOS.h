@@ -20,6 +20,9 @@ public:
   static void Register();
 
   void SetSwDeinterlacingMethods() override;
+  // IsTempoAllowed uses exclusive bounds. Keep audio for the 0.5x–2x UI presets.
+  float MinTempoPlatform() override { return 0.49f; }
+  float MaxTempoPlatform() override { return 2.01f; }
 };
 
 }

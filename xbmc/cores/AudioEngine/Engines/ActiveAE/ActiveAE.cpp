@@ -2663,9 +2663,11 @@ CSampleBuffer* CActiveAE::SyncStream(CActiveAEStream *stream)
     }
   }
 
-  // While the error is averaged, samples that will not be skipped stay audible.
+  // Resampled streams must finish startup correction before becoming audible.
+  // Their clock tolerance can exceed the silence subsequently inserted by SYNC_ADJUST.
   double errorSoFar{0.0};
-  const bool audible{stream->m_syncError.GetSoFar(errorSoFar) && keepAudible(errorSoFar)};
+  const bool audible{!stream->m_resampleMode && stream->m_syncError.GetSoFar(errorSoFar) &&
+                     keepAudible(errorSoFar)};
   if (stream->m_syncState == CAESyncInfo::AESyncState::SYNC_MUTE && !audible)
   {
     CSampleBuffer *buf = stream->m_processingBuffers->m_outputSamples.front();

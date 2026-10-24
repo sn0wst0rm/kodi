@@ -7,6 +7,9 @@
  */
 
 #include "RenderManager.h"
+#if defined(TARGET_DARWIN_IOS)
+#include "HwDecRender/RendererIOS.h"
+#endif
 
 /* to use the same as player */
 #include "../VideoPlayer/DVDClock.h"
@@ -93,7 +96,7 @@ bool CRenderManager::Configure(const VideoPicture& picture, float fps, unsigned 
   {
     std::unique_lock lock(m_statelock);
 
-    if (!m_bRenderGUI)
+    if (!m_bRenderGUI && !m_nativeIOSRenderer)
       return true;
 
     if (m_pRenderer != nullptr && m_picture.IsSameParams(picture) && m_orientation == orientation &&
@@ -206,6 +209,9 @@ bool CRenderManager::Configure()
                 m_QueueSize, renderbuffers, m_NumberBuffers);
     }
 
+#if defined(TARGET_DARWIN_IOS)
+    m_nativeIOSRenderer = dynamic_cast<CRendererIOS*>(m_pRenderer) != nullptr;
+#endif
     m_pRenderer->SetBufferSize(m_QueueSize);
     m_pRenderer->Update();
 
@@ -287,7 +293,14 @@ bool CRenderManager::IsPresenting()
 void CRenderManager::FrameMove()
 {
   bool firstFrame = false;
-  UpdateResolution();
+#if defined(TARGET_DARWIN_IOS)
+  // The native renderer owns no GL resources. Legacy renderers must wait for
+  // the GUI to become drawable before configuring or releasing GL objects.
+  if (!g_application.GetRenderGUI() && !m_nativeIOSRenderer)
+    return;
+#endif
+  if (!m_nativeIOSRenderer || g_application.GetRenderGUI())
+    UpdateResolution();
 
   {
     std::unique_lock lock(m_statelock);
@@ -304,7 +317,13 @@ void CRenderManager::FrameMove()
       FrameWait(50ms);
     }
 
-    CheckEnableClockSync();
+    if (!m_nativeIOSRenderer || g_application.GetRenderGUI())
+      CheckEnableClockSync();
+    else
+    {
+      m_clockSync.Reset();
+      m_dvdClock.SetVsyncAdjust(0);
+    }
   }
   {
     std::unique_lock lock2(m_presentlock);
@@ -346,13 +365,26 @@ void CRenderManager::FrameMove()
     m_bRenderGUI = true;
   }
 
-  m_playerPort->UpdateGuiRender(IsGuiLayer() || !m_pRenderer->VideoBypassesFramebuffer() ||
-                                firstFrame);
+#if defined(TARGET_DARWIN_IOS)
+  if (auto* native = dynamic_cast<CRendererIOS*>(m_pRenderer))
+  {
+    if (native->NeedsPresent(m_presentsource))
+      native->PresentFrame(m_presentsource, IOSIsPictureInPictureActive()
+        ? m_overlays.RenderNative(m_presentsource, native->VideoWidth(), native->VideoHeight())
+        : nullptr);
+    std::unique_lock lock(m_presentlock);
+    if (m_presentstep == PRESENT_FRAME || m_presentstep == PRESENT_FRAME2)
+      m_presentstep = m_queued.empty() ? PRESENT_IDLE : PRESENT_READY;
+    m_presentevent.notifyAll();
+  }
+  // A manual PiP session can coexist with the foreground Kodi GUI. Refresh
+  // its libass image pointers after the native pass; skip only while suspended.
+  if (!m_nativeIOSRenderer || !IOSIsPictureInPictureActive() || g_application.GetRenderGUI())
+#endif
+    m_overlays.PrepareOverlays(m_presentsource);
 
-  // Run libass for the current PTS and cache the output for ConvertLibass
-  // to use during the render pass. PrepareOverlays MarkDirty's on libass
-  // changes and on PGS/DVB/SPU arrival/disappearance.
-  m_overlays.PrepareOverlays(m_presentsource);
+  m_playerPort->UpdateGuiRender(IsGuiLayer() || !m_pRenderer->VideoBypassesFramebuffer() ||
+                               firstFrame);
 }
 
 void CRenderManager::PreInit()
@@ -410,6 +442,7 @@ void CRenderManager::UnInit()
   m_captureBlit.reset();
   DeleteRenderer();
 
+  m_nativeIOSRenderer = false;
   m_renderState = STATE_UNCONFIGURED;
   m_picture.Reset();
   m_bRenderGUI = false;
@@ -720,8 +753,8 @@ bool CRenderManager::IsGuiLayer()
     if (!m_pRenderer)
       return false;
 
-    if ((m_pRenderer->IsGuiLayer() && IsPresenting()) || m_renderedDebugOverlay ||
-        m_overlays.HasVisibleOverlay(m_presentsource))
+    if ((!m_nativeIOSRenderer && m_pRenderer->IsGuiLayer() && IsPresenting()) ||
+        m_renderedDebugOverlay || m_overlays.HasVisibleOverlay(m_presentsource))
       return true;
 
     if (m_renderDebug && m_debugTimer.IsTimePast())
@@ -991,7 +1024,7 @@ int CRenderManager::WaitForBuffer(volatile std::atomic_bool& bStop,
 
   // check if gui is active and discard buffer if not
   // this keeps videoplayer going
-  if (!m_bRenderGUI || !g_application.GetRenderGUI())
+  if ((!m_bRenderGUI || !g_application.GetRenderGUI()) && !m_nativeIOSRenderer)
   {
     m_bRenderGUI = false;
     double presenttime = 0;

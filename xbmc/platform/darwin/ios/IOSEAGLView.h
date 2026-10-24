@@ -36,6 +36,10 @@
   UIScreen* __weak currentScreen;
 
   BOOL framebufferResizeRequested;
+  BOOL geometryInsetsDirty;
+  BOOL framebufferFailureLogged;
+  CFTimeInterval framebufferRetryTime;
+  CGSize requestedDrawableSize;
 }
 @property (readonly, nonatomic, getter=isAnimating) BOOL animating;
 @property (readonly, nonatomic, getter=isXBMCAlive) BOOL xbmcAlive;
@@ -50,7 +54,9 @@
 - (void) resumeAnimation;
 - (void) startAnimation;
 - (void) stopAnimation;
-- (void) setFramebuffer;
+- (void) resizeFrameBuffer;
+- (void) invalidateGUIInsets;
+- (BOOL) setFramebuffer;
 - (bool) presentFramebuffer;
 - (void) setScreen:(UIScreen *)screen withFrameBufferResize:(BOOL)resize;
 - (CGFloat) getScreenScale:(UIScreen *)screen;

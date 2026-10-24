@@ -40,6 +40,9 @@ list(APPEND DEPLIBS "-framework CoreFoundation" "-framework CoreVideo"
                     "-framework CoreMedia" "-framework AVFoundation"
                     "-framework VideoToolbox" "-lresolv" "-ObjC"
                     "-framework AVKit" "-framework GameController")
+if("ios" IN_LIST CORE_PLATFORM_NAME_LC)
+  list(APPEND DEPLIBS "-framework Accelerate")
+endif()
 
 # Speech not available on tvOS
 if(NOT CORE_PLATFORM_NAME_LC STREQUAL tvos)

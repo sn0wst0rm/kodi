@@ -8,6 +8,9 @@
  */
 
 #include "OverlayRendererGLES.h"
+#if defined(TARGET_DARWIN_IOS)
+#include "platform/darwin/ios/IOSHDRVideo.h"
+#endif
 
 #include "LinuxRendererGLES.h"
 #include "OverlayRenderer.h"
@@ -384,7 +387,11 @@ COverlayGlyphGLES::COverlayGlyphGLES(ASS_Image* images, float width, float heigh
 
 COverlayGlyphGLES::~COverlayGlyphGLES()
 {
+#if defined(TARGET_DARWIN_IOS)
+  IOSDeleteVideoTexture(m_texture);
+#else
   glDeleteTextures(1, &m_texture);
+#endif
 }
 
 void COverlayGlyphGLES::Render(SRenderState& state)
@@ -458,7 +465,11 @@ void COverlayGlyphGLES::Render(SRenderState& state)
 
 COverlayTextureGLES::~COverlayTextureGLES()
 {
+#if defined(TARGET_DARWIN_IOS)
+  IOSDeleteVideoTexture(m_texture);
+#else
   glDeleteTextures(1, &m_texture);
+#endif
 }
 
 void COverlayTextureGLES::Render(SRenderState& state)

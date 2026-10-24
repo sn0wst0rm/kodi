@@ -1,0 +1,146 @@
+From 392e7572a137c515cc248d0902324843e7f72753 Mon Sep 17 00:00:00 2001
+From: sn0wst0rm <9982041+sn0wst0rm@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 01:22:15 +0200
+Subject: [PATCH 1/2] Expose Auto and pinned adaptive video qualities for Kodi
+ Duo
+
+---
+ CMakeLists.txt                |  5 +++++
+ src/Session.cpp               | 21 +++++++++++++++++++--
+ src/common/AdaptiveStream.cpp |  3 ++-
+ src/common/AdaptiveStream.h   |  3 +++
+ src/common/Chooser.h          |  2 ++
+ src/common/ChooserDefault.h   |  1 +
+ 6 files changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index d9e7b20..99576ab 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -9,6 +9,10 @@ project(inputstream.adaptive)
+ include(Helpers.cmake)
+ 
+ option(BUILD_TESTING "Build the testing tree." ON)
++option(ENABLE_KODI_DUO_QUALITY "Expose adaptive Auto and pinned video representations" OFF)
++if(ENABLE_KODI_DUO_QUALITY)
++  add_compile_definitions(KODI_DUO_QUALITY)
++endif()
+ set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${PROJECT_SOURCE_DIR})
+ set(CMAKE_FIND_FRAMEWORK LAST)
+ # Sets the default path where the CDM library is contained (affects the default value of the add-on settings)
+@@ -59,6 +63,7 @@ get_property(HEADERS_LIST GLOBAL PROPERTY GlobalHeaderList)
+ list(APPEND ADP_HEADERS ${HEADERS_LIST})
+ 
+ include_directories(${INCLUDES}
++                    ${PUGIXML_INCLUDE_DIRS}
+                     ${KODI_INCLUDE_DIR}/.. # Hack way with "/..", need bigger Kodi cmake rework to match right include ways (becomes done in future)
+                     ${NLOHMANNJSON_INCLUDE_DIRS}
+                     $<$<STREQUAL:${CORE_SYSTEM_NAME},android>:${LIBANDROIDJNI_INCLUDE_DIRS}>
+diff --git a/src/Session.cpp b/src/Session.cpp
+index cc657d2..22ffea9 100644
+--- a/src/Session.cpp
++++ b/src/Session.cpp
+@@ -356,7 +356,7 @@ void SESSION::CSession::InitializePeriod()
+       m_reprChooser->LogDetails(defaultRepr);
+ 
+     // Helper lambda method to add a stream
+-    auto AddStreamRepr = [&](PLAYLIST::CRepresentation* repr) -> bool
++    auto AddStreamRepr = [&](PLAYLIST::CRepresentation* repr, bool fixed = false) -> bool
+     {
+       if (streamIndex >= INPUTSTREAM_MAX_STREAM_COUNT)
+       {
+@@ -368,13 +368,30 @@ void SESSION::CSession::InitializePeriod()
+       }
+ 
+       const uint32_t uniqueId = MakeUniqueId(periodIndex, streamIndex);
+-      const bool isDefaultVideoRepr{isDefaultAdpSet && repr == defaultRepr};
++      const bool isDefaultVideoRepr{!fixed && isDefaultAdpSet && repr == defaultRepr};
+ 
+       AddStream(adp.get(), repr, isDefaultVideoRepr, uniqueId);
++      m_streams.back()->m_adStream.SetFixedRepresentation(fixed);
+       ++streamIndex;
+       return true;
+     };
+ 
++#ifdef KODI_DUO_QUALITY
++    if (adp->GetStreamType() == StreamType::VIDEO &&
++        m_reprChooser->SupportsAutoManualSelection() && adp->GetRepresentations().size() > 1)
++    {
++      if (AddStreamRepr(defaultRepr))
++        m_streams.back()->m_info.SetName("Auto");
++      for (const auto& rep : adp->GetRepresentations())
++      {
++        if (!rep->isPlayable)
++          continue;
++        if (!AddStreamRepr(rep.get(), true))
++          break;
++      }
++    }
++    else
++#endif
+     if (isManualStreamSelection)
+     {
+       // Add all stream representations
+diff --git a/src/common/AdaptiveStream.cpp b/src/common/AdaptiveStream.cpp
+index aac8b75..7d1d30f 100644
+--- a/src/common/AdaptiveStream.cpp
++++ b/src/common/AdaptiveStream.cpp
+@@ -912,7 +912,8 @@ bool adaptive::AdaptiveStream::ensureSegment()
+           // The representation from the last added segment buffer
+           CRepresentation* prevRep = newRep;
+ 
+-          newRep = m_tree->GetRepChooser()->GetNextRepresentation(current_adp_, prevRep);
++          if (!m_fixedRepresentation)
++            newRep = m_tree->GetRepChooser()->GetNextRepresentation(current_adp_, prevRep);
+ 
+           //! @todo: There is the possibility that stream quality switching happen frequently in very short time,
+           //! so if OnStreamChange is used on a parser, it could overload servers of manifest requests
+diff --git a/src/common/AdaptiveStream.h b/src/common/AdaptiveStream.h
+index 658a72c..ba18a01 100644
+--- a/src/common/AdaptiveStream.h
++++ b/src/common/AdaptiveStream.h
+@@ -128,6 +128,8 @@ enum class EVENT_TYPE
+ 
+     bool OnSampleRequested();
+ 
++    // Set before starting the stream to pin a user-selected quality.
++    void SetFixedRepresentation(bool fixed) { m_fixedRepresentation = fixed; }
+     void FixateInitialization(bool on);
+     void AllowBufferQueue(bool isAllowed) { m_isAllowedBufferQueue = isAllowed; }
+     void SetSegmentFileOffset(uint64_t offset) { m_segmentFileOffset = offset; };
+@@ -268,6 +270,7 @@ enum class EVENT_TYPE
+     AdaptiveStreamObserver* observer_{nullptr};
+     // Active configuration
+     PLAYLIST::CPeriod* current_period_;
++    bool m_fixedRepresentation{false};
+     PLAYLIST::CAdaptationSet* current_adp_;
+     PLAYLIST::CRepresentation* current_rep_;
+     PLAYLIST::CRepresentation* m_switchRep{nullptr};
+diff --git a/src/common/Chooser.h b/src/common/Chooser.h
+index 1219e5a..4a1dc8f 100644
+--- a/src/common/Chooser.h
++++ b/src/common/Chooser.h
+@@ -76,6 +76,8 @@ public:
+    *        in playback.
+    * \return The stream selection mode
+    */
++  virtual bool SupportsAutoManualSelection() const { return false; }
++
+   virtual StreamSelection GetStreamSelectionMode() { return StreamSelection::AUTO; }
+ 
+   /*!
+diff --git a/src/common/ChooserDefault.h b/src/common/ChooserDefault.h
+index ad53f36..72a3676 100644
+--- a/src/common/ChooserDefault.h
++++ b/src/common/ChooserDefault.h
+@@ -32,6 +32,7 @@ public:
+   virtual void PostInit() override;
+ 
+   void SetDownloadSpeed(const double speed) override;
++  bool SupportsAutoManualSelection() const override { return true; }
+ 
+   PLAYLIST::CRepresentation* GetNextRepresentation(PLAYLIST::CAdaptationSet* adp,
+                                                    PLAYLIST::CRepresentation* currentRep) override;
+-- 
+2.54.0 (Apple Git-157)
+

@@ -10,6 +10,9 @@
 #pragma once
 
 #include "BaseRenderer.h"
+#if defined(TARGET_DARWIN_IOS)
+#include "platform/darwin/ios/IOSHDRVideo.h"
+#endif
 #include "cores/VideoPlayer/DVDCodecs/Overlay/DVDOverlay.h"
 #include "cores/VideoPlayer/DVDSubtitles/SubtitlesStyle.h"
 #include "settings/SubtitlesSettings.h"
@@ -125,6 +128,10 @@ namespace OVERLAY {
      *  a visible or changed subtitle.
      */
     void PrepareOverlays(int idx);
+#if defined(TARGET_DARWIN_IOS)
+    std::shared_ptr<IOSSubtitleBitmap> RenderNative(int idx, int videoWidth, int videoHeight);
+    std::shared_ptr<IOSSubtitleBitmap> m_nativeBitmap;
+#endif
 
     /*!
      * \brief Release resources

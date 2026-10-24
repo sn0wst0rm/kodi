@@ -9,6 +9,7 @@
 #include "WinSystemIOS.h"
 
 #include "ServiceBroker.h"
+#include "cores/DataCacheCore.h"
 #include "VideoSyncIos.h"
 #include "WinEventsIOS.h"
 #include "cores/AudioEngine/Sinks/AESinkDARWINIOS.h"
@@ -23,6 +24,8 @@
 #include "filesystem/SpecialProtocol.h"
 #include "guilib/DispResource.h"
 #include "guilib/Texture.h"
+#include "guilib/GUIComponent.h"
+#include "guilib/GUIWindowManager.h"
 #include "messaging/ApplicationMessenger.h"
 #include "rendering/gles/ScreenshotSurfaceGLES.h"
 #include "settings/DisplaySettings.h"
@@ -34,11 +37,15 @@
 #include "windowing/WindowSystemFactory.h"
 
 #import "platform/darwin/ios/IOSScreenManager.h"
+#include "platform/darwin/ios/IOSHDRVideo.h"
 #import "platform/darwin/ios/XBMCController.h"
 
 #include <memory>
 #include <mutex>
 #include <vector>
+#include <algorithm>
+#include <cmath>
+#include <thread>
 
 #import <Foundation/Foundation.h>
 #import <OpenGLES/ES2/gl.h>
@@ -60,6 +67,16 @@
 
 using namespace KODI;
 using namespace MESSAGING;
+
+bool CWinSystemIOS::SetHDR(const VideoPicture* picture)
+{
+  if (!picture || !IOSSupportsHDRVideo())
+    return false;
+  auto* buffer = dynamic_cast<VTB::CVideoBufferVTB*>(picture->videoBuffer);
+  return buffer && IOSIsTenBitVideo(buffer->GetPB()) &&
+         (picture->color_transfer == AVCOL_TRC_SMPTE2084 ||
+          picture->color_transfer == AVCOL_TRC_ARIB_STD_B67);
+}
 
 struct CADisplayLinkWrapper
 {
@@ -219,6 +236,11 @@ bool CWinSystemIOS::SwitchToVideoMode(int width, int height, double refreshrate)
   bool ret = false;
   int screenIdx = GetDisplayIndexFromSettings();
 
+  // Scene geometry, not a physical display mode, determines the internal
+  // drawable. Switching a screen mode here would undo fold/window resizing.
+  if (screenIdx == 0)
+    return true;
+
   //get the mode to pass to the controller
   UIScreenMode *newMode = getModeForResolution(width, height, screenIdx);
 
@@ -251,17 +273,11 @@ bool CWinSystemIOS::GetScreenResolution(int* w, int* h, double* fps, int screenI
   // the device and eagl gives the correct values in all cases.
   if(screenIdx == 0)
   {
-    // at very first start up we cache the internal screen resolution
-    // because when using external screens and need to go back
-    // to internal we are not able to determine the eagl bounds
-    // before we really switched back to internal
-    // but display settings ask for the internal resolution before
-    // switching. So we give the cached values back in that case.
-    if (m_internalTouchscreenResolutionWidth == -1 &&
-        m_internalTouchscreenResolutionHeight == -1)
+    if (![[IOSScreenManager sharedInstance] isExternalScreen])
     {
-      m_internalTouchscreenResolutionWidth = [g_xbmcController getScreenSize].width;
-      m_internalTouchscreenResolutionHeight = [g_xbmcController getScreenSize].height;
+      const CGSize size = [g_xbmcController getScreenSize];
+      m_internalTouchscreenResolutionWidth = size.width;
+      m_internalTouchscreenResolutionHeight = size.height;
     }
 
     *w = m_internalTouchscreenResolutionWidth;
@@ -335,10 +351,31 @@ bool CWinSystemIOS::BeginRender()
 {
   bool rtn;
 
-  [g_xbmcController setFramebuffer];
+  if (![g_xbmcController setFramebuffer])
+    return false;
 
   rtn = CRenderSystemGLES::BeginRender();
   return rtn;
+}
+
+void CWinSystemIOS::OnDrawableResized(int width, int height)
+{
+  if (width <= 0 || height <= 0 || (m_nWidth == width && m_nHeight == height))
+    return;
+
+  const bool external = [[IOSScreenManager sharedInstance] isExternalScreen];
+  if (!external)
+  {
+    m_internalTouchscreenResolutionWidth = width;
+    m_internalTouchscreenResolutionHeight = height;
+  }
+  auto& desktop = CDisplaySettings::GetInstance().GetResolutionInfo(RES_DESKTOP);
+  UpdateDesktopResolution(desktop, external ? CONST_EXTERNAL : CONST_TOUCHSCREEN,
+                          width, height, desktop.fRefreshRate, 0);
+  GetGfxContext().ResetOverscan(desktop);
+  [g_xbmcController setGUIInsetsFromMainThread:NO];
+  GetGfxContext().SetVideoResolution(RES_DESKTOP, true);
+  CLog::Log(LOGINFO, "iOS drawable resized to {} x {}", width, height);
 }
 
 bool CWinSystemIOS::EndRender()
@@ -423,6 +460,31 @@ void CWinSystemIOS::DeinitDisplayLink(void)
 }
 //------------DisplayLink stuff end
 //--------------------------------------------------------------
+
+void CWinSystemIOS::PresentRender(bool rendered, bool videoLayer)
+{
+  const bool nativeVideo = IOSNativeVideoRenderingActive();
+  const bool videoOnly = nativeVideo && !rendered && !IOSIsPictureInPictureActive() &&
+      GetGfxContext().IsFullScreenVideo() && GetGfxContext().GetStereoMode() == RenderStereoMode::OFF &&
+      !CServiceBroker::GetDataCacheCore().GetGuiRender() &&
+      !CServiceBroker::GetGUI()->GetWindowManager().HasVisibleControls();
+  IOSSetNativeVideoOnly(videoOnly);
+  // With no GL swap there is no vsync wait. The generic idle delay is 40ms,
+  // which would starve 50/60fps native playback; removing it without a paced
+  // wait would instead busy-loop. Account for work already done this tick.
+  if (!rendered && nativeVideo)
+  {
+    double fps = GetGfxContext().GetFPS();
+    if (!std::isfinite(fps))
+      fps = 60.0;
+    fps = std::clamp(fps, 60.0, 240.0);
+    const auto interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(1.0 / fps));
+    std::this_thread::sleep_until(m_lastNativeFrameTick + interval);
+  }
+  CRenderSystemGLES::PresentRender(rendered, videoLayer || nativeVideo);
+  m_lastNativeFrameTick = std::chrono::steady_clock::now();
+}
 
 void CWinSystemIOS::PresentRenderImpl(bool rendered)
 {

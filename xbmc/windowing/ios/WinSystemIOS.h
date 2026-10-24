@@ -14,6 +14,7 @@
 
 #include <string>
 #include <vector>
+#include <chrono>
 
 #include <CoreVideo/CVOpenGLESTextureCache.h>
 
@@ -41,6 +42,7 @@ public:
   bool SetFullScreen(bool fullScreen, RESOLUTION_INFO& res, bool blankOtherDisplays) override;
   void UpdateResolutions() override;
   bool CanDoWindowed() override { return false; }
+  bool SetHDR(const VideoPicture* picture) override;
 
   void ShowOSMouse(bool show) override {}
   bool HasCursor() override;
@@ -56,6 +58,7 @@ public:
 
   bool BeginRender() override;
   bool EndRender() override;
+  void PresentRender(bool rendered, bool videoLayer) override;
 
   void Register(IDispResource *resource) override;
   void Unregister(IDispResource *resource) override;
@@ -70,6 +73,8 @@ public:
   bool IsBackgrounded() const { return m_bIsBackgrounded; }
   CVEAGLContext GetEAGLContextObj();
   void MoveToTouchscreen();
+  // Called only by the render thread after reallocating its drawable.
+  void OnDrawableResized(int width, int height);
 
   // winevents override
   bool MessagePump() override;
@@ -93,5 +98,6 @@ private:
   CADisplayLinkWrapper *m_pDisplayLink;
   int m_internalTouchscreenResolutionWidth = -1;
   int m_internalTouchscreenResolutionHeight = -1;
+  std::chrono::steady_clock::time_point m_lastNativeFrameTick{};
 };
 

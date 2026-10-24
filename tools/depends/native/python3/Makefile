@@ -13,6 +13,8 @@ endif
 
 LIBDYLIB=$(PLATFORM)/python
 ifeq ($(NATIVE_OS), osx)
+    # SDK 27 declares these, but the native tools also target older macOS.
+    CONFIGURE += ac_cv_func_dup3=no ac_cv_func_pipe2=no
     # Case insensitive FS will add .exe to buildexe regardless of --with-suffix=no
 	LIBDYLIB=$(PLATFORM)/python.exe
 endif

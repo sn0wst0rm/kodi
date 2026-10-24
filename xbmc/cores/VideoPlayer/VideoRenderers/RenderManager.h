@@ -161,6 +161,7 @@ protected:
   void UpdateLatencyTweak();
   void CheckEnableClockSync();
 
+  std::atomic_bool m_nativeIOSRenderer{false};
   CBaseRenderer *m_pRenderer = nullptr;
   //! Owns the video tap's private FBO; render-thread only, reset in UnInit
   std::unique_ptr<KODI::RENDERING::CAPTURE::CCaptureBlit> m_captureBlit;

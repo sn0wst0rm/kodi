@@ -22,6 +22,12 @@
 #include "settings/SettingsComponent.h"
 #include "utils/TimeUtils.h"
 #include "utils/log.h"
+#include "windowing/ios/WinSystemIOS.h"
+
+#include <cmath>
+#include <mutex>
+#include <vector>
+#include "platform/darwin/ios/IOSHDRVideo.h"
 
 #import "platform/darwin/DarwinUtils.h"
 #import "platform/darwin/NSLogDebugHelpers.h"
@@ -35,10 +41,36 @@
 #import <QuartzCore/QuartzCore.h>
 #include <sys/resource.h>
 
+namespace
+{
+std::mutex deferredTextureMutex;
+std::vector<GLuint> deferredVideoTextures;
+}
+void IOSDeleteVideoTexture(unsigned int texture)
+{
+  if (!texture) return;
+  if (g_application.GetRenderGUI())
+    glDeleteTextures(1, &texture);
+  else
+  {
+    std::lock_guard<std::mutex> lock(deferredTextureMutex);
+    deferredVideoTextures.push_back(texture);
+  }
+}
+void IOSDrainVideoTextures()
+{
+  std::lock_guard<std::mutex> lock(deferredTextureMutex);
+  if (!deferredVideoTextures.empty())
+  {
+    glDeleteTextures(deferredVideoTextures.size(), deferredVideoTextures.data());
+    deferredVideoTextures.clear();
+  }
+}
+
 //--------------------------------------------------------------
 @interface IOSEAGLView (PrivateMethods)
 - (void) setContext:(EAGLContext *)newContext;
-- (void) createFramebuffer;
+- (BOOL) createFramebuffer;
 - (void) deleteFramebuffer;
 - (void) runDisplayLink;
 @end
@@ -60,39 +92,44 @@
 //--------------------------------------------------------------
 - (void) resizeFrameBuffer
 {
-  auto frame = currentScreen.bounds;
-  CAEAGLLayer *eaglLayer = (CAEAGLLayer *)[self layer];
-  //allow a maximum framebuffer size of 1080p
-  //needed for tvout on iPad3/4 and iphone4/5 and maybe AppleTV3
-  if(frame.size.width * frame.size.height > 2073600)
+  // UIKit owns geometry. Only publish the new drawable size here: the EAGL
+  // context belongs to Kodi's render thread once animation has started.
+  CGFloat scale = self.traitCollection.displayScale;
+  if (scale <= 0)
     return;
-  //resize the layer - ios will delay this
-  //and call layoutSubviews when its done with resizing
-  //so the real framebuffer resize is done there then ...
-  if(framebufferWidth != frame.size.width ||
-     framebufferHeight != frame.size.height )
+  self.contentScaleFactor = scale;
+  self.layer.contentsScale = scale;
+  const CGSize size = CGSizeMake(std::round(self.bounds.size.width * scale),
+                                 std::round(self.bounds.size.height * scale));
+  if (size.width <= 0 || size.height <= 0)
+    return;
+  @synchronized(self)
   {
-    framebufferResizeRequested = TRUE;
-    [eaglLayer setFrame:frame];
+    if (!CGSizeEqualToSize(size, requestedDrawableSize))
+    {
+      requestedDrawableSize = size;
+      framebufferResizeRequested = YES;
+    }
+  }
+}
+
+- (void)invalidateGUIInsets
+{
+  @synchronized(self)
+  {
+    geometryInsetsDirty = YES;
   }
 }
 
 - (void)layoutSubviews
 {
-  if(framebufferResizeRequested)
-  {
-    framebufferResizeRequested = FALSE;
-    [self deleteFramebuffer];
-    [self createFramebuffer];
-    [self setFramebuffer];
-  }
+  [super layoutSubviews];
+  [self resizeFrameBuffer];
 }
 
 - (CGFloat)getScreenScale:(UIScreen *)screen
 {
-  LOG(@"nativeScale %lf, scale %lf, traitScale %lf", screen.nativeScale, screen.scale,
-            screen.traitCollection.displayScale);
-  return std::max({screen.nativeScale, screen.scale, screen.traitCollection.displayScale});
+  return self.traitCollection.displayScale;
 }
 
 - (void) setScreen:(UIScreen *)screen withFrameBufferResize:(BOOL)resize
@@ -117,8 +154,14 @@
 {
   //PRINT_SIGNATURE();
   framebufferResizeRequested = FALSE;
+  geometryInsetsDirty = YES;
   if ((self = [super initWithFrame:frame]))
   {
+    if (@available(iOS 17.0, *))
+    {
+      [self registerForTraitChanges:@[[UITraitDisplayScale class]]
+                         withAction:@selector(resizeFrameBuffer)];
+    }
     // Get the layer
     CAEAGLLayer *eaglLayer = (CAEAGLLayer *)self.layer;
     //set screen, handlescreenscale
@@ -179,7 +222,7 @@
 }
 
 //--------------------------------------------------------------
-- (void)createFramebuffer
+- (BOOL)createFramebuffer
 {
   if (context && !defaultFramebuffer)
   {
@@ -193,7 +236,8 @@
     // Create color render buffer and allocate backing store.
     glGenRenderbuffers(1, &colorRenderbuffer);
     glBindRenderbuffer(GL_RENDERBUFFER, colorRenderbuffer);
-    [context renderbufferStorage:GL_RENDERBUFFER fromDrawable:(CAEAGLLayer *)self.layer];
+    const BOOL storageAllocated =
+        [context renderbufferStorage:GL_RENDERBUFFER fromDrawable:(CAEAGLLayer *)self.layer];
     glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_WIDTH, &framebufferWidth);
     glGetRenderbufferParameteriv(GL_RENDERBUFFER, GL_RENDERBUFFER_HEIGHT, &framebufferHeight);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, colorRenderbuffer);
@@ -203,16 +247,27 @@
     glRenderbufferStorage(GL_RENDERBUFFER, GL_DEPTH_COMPONENT16, framebufferWidth, framebufferHeight);
     glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, GL_RENDERBUFFER, depthRenderbuffer);
 
-    if (glCheckFramebufferStatus(GL_FRAMEBUFFER) != GL_FRAMEBUFFER_COMPLETE)
-      ELOG(@"Failed to make complete framebuffer object %x", glCheckFramebufferStatus(GL_FRAMEBUFFER));
+    const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    if (!storageAllocated || framebufferWidth <= 0 || framebufferHeight <= 0 ||
+        status != GL_FRAMEBUFFER_COMPLETE)
+    {
+      if (!framebufferFailureLogged)
+        ELOG(@"Drawable unavailable; retrying framebuffer allocation (%x)", status);
+      framebufferFailureLogged = YES;
+      [self deleteFramebuffer];
+      framebufferRetryTime = CACurrentMediaTime() + 0.1;
+      return NO;
+    }
+    framebufferFailureLogged = NO;
+    framebufferRetryTime = 0;
   }
+  return defaultFramebuffer != 0;
 }
 //--------------------------------------------------------------
 - (void) deleteFramebuffer
 {
   if (context && !pause)
   {
-    PRINT_SIGNATURE();
     [EAGLContext setCurrentContext:context];
 
     if (defaultFramebuffer)
@@ -232,35 +287,70 @@
       glDeleteRenderbuffers(1, &depthRenderbuffer);
       depthRenderbuffer = 0;
     }
+    framebufferWidth = 0;
+    framebufferHeight = 0;
   }
 }
 //--------------------------------------------------------------
-- (void) setFramebuffer
+- (BOOL) setFramebuffer
 {
   if (context && !pause)
   {
     if ([EAGLContext currentContext] != context)
       [EAGLContext setCurrentContext:context];
 
-    glBindFramebuffer(GL_FRAMEBUFFER, defaultFramebuffer);
+    IOSDrainVideoTextures();
+    if (CACurrentMediaTime() < framebufferRetryTime)
+      return NO;
 
-    if(framebufferHeight > framebufferWidth) {
-      glViewport(0, 0, framebufferHeight, framebufferWidth);
-      glScissor(0, 0, framebufferHeight, framebufferWidth);
-    }
-    else
+    BOOL resize = NO;
+    BOOL updateInsets = NO;
+    @synchronized(self)
     {
-      glViewport(0, 0, framebufferWidth, framebufferHeight);
-      glScissor(0, 0, framebufferWidth, framebufferHeight);
+      resize = framebufferResizeRequested || !defaultFramebuffer;
+      framebufferResizeRequested = NO;
+      // Keep the first update queued until Kodi's display settings exist.
+      if (xbmcAlive)
+      {
+        updateInsets = geometryInsetsDirty;
+        geometryInsetsDirty = NO;
+      }
     }
+    if (resize)
+    {
+      [self deleteFramebuffer];
+      if (![self createFramebuffer])
+      {
+        @synchronized(self)
+        {
+          framebufferResizeRequested = YES;
+          geometryInsetsDirty = YES;
+        }
+        return NO;
+      }
+      if (framebufferWidth > 0 && framebufferHeight > 0 && xbmcAlive)
+      {
+        static_cast<CWinSystemIOS*>(CServiceBroker::GetWinSystem())
+            ->OnDrawableResized(framebufferWidth, framebufferHeight);
+      }
+    }
+    // Insets can change without drawable dimensions changing (for example,
+    // system UI or a scene safe-area update). Never tie this to the resize guard.
+    if (updateInsets)
+      [g_xbmcController setGUIInsetsFromMainThread:NO];
+    glBindFramebuffer(GL_FRAMEBUFFER, defaultFramebuffer);
+    glViewport(0, 0, framebufferWidth, framebufferHeight);
+    glScissor(0, 0, framebufferWidth, framebufferHeight);
+    return YES;
   }
+  return NO;
 }
 //--------------------------------------------------------------
 - (bool) presentFramebuffer
 {
   bool success = FALSE;
 
-  if (context && !pause)
+  if (context && !pause && defaultFramebuffer && colorRenderbuffer)
   {
     if ([EAGLContext currentContext] != context)
       [EAGLContext setCurrentContext:context];
@@ -274,11 +364,20 @@
 //--------------------------------------------------------------
 - (void) pauseAnimation
 {
-  PRINT_SIGNATURE();
+  if (pause) return;
+  if (xbmcAlive)
+  {
+    // Finish outstanding GL work on its owning thread before returning to
+    // UIKit's background transition. Do not transfer EAGLContext to UIKit.
+    KODI::MESSAGING::ThreadMessageCallback callback;
+    callback.userptr = nullptr;
+    callback.callback = [](void*) {
+      if (auto port = CServiceBroker::GetAppPort()) port->SetRenderGUI(false);
+      glFinish();
+    };
+    CServiceBroker::GetAppMessenger()->SendMsg(TMSG_CALLBACK, -1, -1, &callback);
+  }
   pause = TRUE;
-  std::shared_ptr<CAppInboundProtocol> appPort = CServiceBroker::GetAppPort();
-  if (appPort)
-    appPort->SetRenderGUI(false);
 }
 //--------------------------------------------------------------
 - (void) resumeAnimation
@@ -302,6 +401,7 @@
     animationThread = [[NSThread alloc] initWithTarget:self
       selector:@selector(runAnimation:)
       object:animationThreadLock];
+    [EAGLContext setCurrentContext:nil];
     [animationThread start];
 	}
 }

@@ -262,6 +262,14 @@ void CVideoPlayerAudio::Process()
     if (m_paused)
       priority = 1;
 
+    // Once paused or waiting for sync, the sink can drain to an empty cache.
+    // A zero timeout then polls only the priority queue forever: the timeout
+    // branch below continues before its normal stall sleep. Wait on the queue
+    // event instead, which still wakes immediately for resume/flush/stop.
+    // Keep the deliberate nonblocking decoder-drain probe below unchanged.
+    if (priority && timeout < 10ms)
+      timeout = 10ms;
+
     if (onlyPrioMsgs)
     {
       priority = 1;
@@ -594,6 +602,14 @@ bool CVideoPlayerAudio::ProcessDecoderOutput(DVDAudioFrame &audioframe)
 
 void CVideoPlayerAudio::SetSyncType(bool passthrough)
 {
+#if defined(TARGET_DARWIN_IOS)
+  // Tempo, live streams and display-clock synchronization require resampling.
+  const bool tempo = m_speed > 0 && m_speed != DVD_PLAYSPEED_NORMAL &&
+      m_processInfo.IsTempoAllowed(static_cast<float>(m_speed) / DVD_PLAYSPEED_NORMAL);
+  m_synctype = tempo || m_processInfo.IsRealtimeStream() ||
+      CServiceBroker::GetSettingsComponent()->GetSettings()->GetBool(
+          CSettings::SETTING_VIDEOPLAYER_USEDISPLAYASCLOCK) ? SYNC_RESAMPLE : SYNC_DISCON;
+#endif
   if (passthrough && m_synctype == SYNC_RESAMPLE)
     m_synctype = SYNC_DISCON;
 

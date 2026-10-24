@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "snapshot_date": "2026-10-24",
+  "channel": "canary",
+  "kodi": {
+    "upstream_repository": "https://github.com/xbmc/xbmc.git",
+    "base_branch": "master",
+    "base_commit": "0658cd06e07d1b4b23c4155404c9006a4ccf0951",
+    "version": "23.0-ALPHA1",
+    "configuration": "Release",
+    "sdk": "iphoneos27.1",
+    "architecture": "arm64",
+    "deployment_target": "15.0"
+  },
+  "inputstream_adaptive": {
+    "repository": "https://github.com/xbmc/inputstream.adaptive.git",
+    "version": "22.3.23",
+    "base_branch": "Piers",
+    "base_commit": "e7418d4e8441dc53316657faf34c2f353c901a7e",
+    "source_commit": "d16342f1790c0a2ad269a1e8b097a75916bea133",
+    "source_tree": "bb8d58cab769c90d746fdf4d76872823f7b52250",
+    "patches": [
+      {
+        "file": "inputstream-adaptive/0001-Expose-Auto-and-pinned-adaptive-video-qualities-for-.patch",
+        "sha256": "6481269c1abd3ef1942ea080f4e1c28ca39fbe8727aa8192c460d20186d9d75f"
+      },
+      {
+        "file": "inputstream-adaptive/0002-Use-Apple-CommonCrypto-for-Bento4-AES-CBC-and-CTR.patch",
+        "sha256": "a1aad7a517539b9264c06c454c2dd5079843d9661af579be71dfa26722bfb27b"
+      },
+      {
+        "file": "inputstream-adaptive/0003-Preserve-fractional-segment-durations-at-live-start.patch",
+        "sha256": "dc16ce84901e888af2dc78b85fbc7a8cc8eceeb9c0518810970aafbdd91a07d5"
+      }
+    ],
+    "cmake_options": {
+      "CMAKE_BUILD_TYPE": "Release",
+      "CMAKE_OSX_DEPLOYMENT_TARGET": "15.0",
+      "ENABLE_INTERNAL_BENTO4": "ON",
+      "ENABLE_KODI_DUO_QUALITY": "ON",
+      "BUILD_TESTING": "OFF"
+    },
+    "bento4_version": "1.6.0-641-6-Piers",
+    "pugixml_version": "1.16",
+    "nlohmann_json_version": "3.12.0"
+  },
+  "iptv_simple": {
+    "repository": "https://github.com/kodi-pvr/pvr.iptvsimple.git",
+    "base_branch": "Piers",
+    "base_commit": "2066e6e6d9fc34f7fe454d91025bcb56de156b74",
+    "version": "22.6.5",
+    "local_source_modifications": false
+  }
+}
