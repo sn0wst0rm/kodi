@@ -82,9 +82,15 @@ namespace
 {
 struct IOSHDRFrame
 {
-  IOSHDRFrame(CVPixelBufferRef image) : buffer(CVPixelBufferRetain(image)) {}
-  ~IOSHDRFrame() { CVPixelBufferRelease(buffer); }
+  IOSHDRFrame(CVPixelBufferRef image)
+    : buffer(CVPixelBufferRetain(image)), sourceBuffer(CVPixelBufferRetain(image)) {}
+  ~IOSHDRFrame() { CVPixelBufferRelease(buffer); CVPixelBufferRelease(sourceBuffer); }
   CVPixelBufferRef buffer;
+  CVPixelBufferRef sourceBuffer;
+  uint64_t rangeGeneration{0};
+  bool sdrConverted{false};
+  int32_t conversionError{0};
+  double conversionMilliseconds{0};
   uint64_t session{0};
   IOSHDRVideoMetadata metadata;
   std::shared_ptr<IOSSubtitleBitmap> subtitles;
@@ -101,6 +107,8 @@ uint64_t hdrSessionCounter{0};
 uint64_t hdrActiveSession{0};
 bool hdrDeliveryScheduled{false};
 std::atomic_bool pipActive{false};
+std::atomic_bool hdrOutputEnabled{true};
+std::atomic_uint64_t hdrRangeGeneration{0};
 void ScheduleHDRDelivery(); // caller holds hdrMutex
 }
 
@@ -386,7 +394,24 @@ void ScheduleHDRDelivery()
         std::lock_guard<std::mutex> lock(hdrMutex);
         frame = std::move(hdrPendingFrame);
       }
-      if (frame) FillVideoMetadata(*frame);
+      if (frame)
+      {
+        frame->rangeGeneration = hdrRangeGeneration.load();
+        FillVideoMetadata(*frame);
+        if (!hdrOutputEnabled.load() && IOSIsTenBitVideo(frame->sourceBuffer) &&
+            (frame->metadata.transfer == 16 || frame->metadata.transfer == 18))
+        {
+          const double started = CACurrentMediaTime();
+          CVPixelBufferRef sdr = IOSConvertVideoToSDR(frame->buffer, &frame->conversionError);
+          frame->conversionMilliseconds = (CACurrentMediaTime() - started) * 1000;
+          if (sdr)
+          {
+            CVPixelBufferRelease(frame->buffer);
+            frame->buffer = sdr;
+            frame->sdrConverted = true;
+          }
+        }
+      }
       if (frame && frame->subtitles && IOSIsPictureInPictureActive())
       {
         CVPixelBufferRef composited = IOSCompositeVideo(frame->buffer, *frame->subtitles);
@@ -400,7 +425,8 @@ void ScheduleHDRDelivery()
         bool current;
         {
           std::lock_guard<std::mutex> lock(hdrMutex);
-          current = frame && frame->session == hdrActiveSession;
+          current = frame && frame->session == hdrActiveSession &&
+              frame->rangeGeneration == hdrRangeGeneration.load();
           hdrDeliveryScheduled = false;
           if (hdrPendingFrame) ScheduleHDRDelivery();
         }
@@ -562,17 +588,43 @@ void ScheduleHDRDelivery()
       [self updatePictureInPictureState];
     }
     bool sameImage = m_hdrEnqueuedFrame && m_hdrEnqueuedFrame->buffer == frame->buffer;
+    const bool outputRangeChanged = m_hdrDisplayedFrame &&
+        frame->sdrConverted != m_hdrDisplayedFrame->sdrConverted;
     const bool dynamicRangeChanged = !m_hdrDisplayedFrame ||
+        outputRangeChanged ||
         frame->metadata.transfer != m_hdrDisplayedFrame->metadata.transfer ||
         frame->metadata.hasLight != m_hdrDisplayedFrame->metadata.hasLight ||
         frame->metadata.light != m_hdrDisplayedFrame->metadata.light ||
         frame->metadata.hasMastering != m_hdrDisplayedFrame->metadata.hasMastering ||
         frame->metadata.mastering != m_hdrDisplayedFrame->metadata.mastering;
     m_hdrDisplayedFrame = frame;
+    if (frame->conversionError)
+    {
+      CLog::Log(LOGERROR, "iOS HDR: SDR conversion failed ({}), keeping HDR enabled",
+          frame->conversionError);
+      [NSUserDefaults.standardUserDefaults setBool:YES forKey:@"DuoHDREnabled"];
+      [self applyHDRPreference];
+      [self renderFoldSettings];
+      if (!self.presentedViewController)
+      {
+        UIAlertController* alert = [UIAlertController alertControllerWithTitle:@"HDR rimane attivo"
+            message:@"La conversione SDR non è disponibile per questo video."
+            preferredStyle:UIAlertControllerStyleAlert];
+        [alert addAction:[UIAlertAction actionWithTitle:@"OK" style:UIAlertActionStyleDefault handler:nil]];
+        [self presentViewController:alert animated:YES completion:nil];
+      }
+    }
     if (dynamicRangeChanged)
       [self applyHDRPreference];
     [self layoutHDRVideo];
     auto* renderer = m_hdrLayer.sampleBufferRenderer;
+    if (outputRangeChanged)
+    {
+      // Remove queued frames in the previous colour space without replacing
+      // the AVKit/PiP content source or restarting audio and the decoder.
+      [renderer flush];
+      sameImage = false;
+    }
     if (renderer.status == AVQueuedSampleBufferRenderingStatusFailed ||
         renderer.requiresFlushToResumeDecoding)
     {
@@ -620,7 +672,8 @@ void ScheduleHDRDelivery()
           "iOS HDR: native renderer status={}, pixelFormat={:#x}, transfer={}, primaries={}, "
           "mastering={}, light={}, EDR current={:.2f} potential={:.2f}, "
           "scene={:.0f}x{:.0f}, canvas={:.0f}x{:.0f}, tabletop={}, "
-          "HDR requested={}, content headroom={:.2f}, pixel transfer={}, brightness={:.2f}, thermal={}",
+          "HDR requested={}, content headroom={:.2f}, pixel transfer={}, brightness={:.2f}, thermal={}, "
+          "SDR converted={}, conversion ms={:.2f}",
           static_cast<int>(renderer.status), CVPixelBufferGetPixelFormatType(frame->buffer),
           frame->metadata.transfer, frame->metadata.primaries,
           !!CVBufferHasAttachment(frame->buffer, kCVImageBufferMasteringDisplayColorVolumeKey),
@@ -629,10 +682,11 @@ void ScheduleHDRDelivery()
           self.view.bounds.size.width, self.view.bounds.size.height,
           m_glView.bounds.size.width, m_glView.bounds.size.height, !m_foldControls.hidden,
           [self foldSourceIsHDR] && [self foldHDREnabled],
-          [self foldSourceIsHDR] ? IOSHDRContentHeadroom(frame->metadata) : 1.0,
+          [self foldSourceIsHDR] && !frame->sdrConverted ? IOSHDRContentHeadroom(frame->metadata) : 1.0,
           CVTransferFunctionGetIntegerCodePointForString(static_cast<CFStringRef>(
               CVBufferGetAttachment(frame->buffer, kCVImageBufferTransferFunctionKey, nullptr))),
-          screen.brightness, static_cast<long>(NSProcessInfo.processInfo.thermalState));
+          screen.brightness, static_cast<long>(NSProcessInfo.processInfo.thermalState),
+          frame->sdrConverted, frame->conversionMilliseconds);
       m_hdrReported = YES;
     }
   }
@@ -1314,7 +1368,7 @@ void ScheduleHDRDelivery()
 
 - (BOOL)foldSourceIsHDR
 {
-  return m_hdrDisplayedFrame && IOSIsTenBitVideo(m_hdrDisplayedFrame->buffer) &&
+  return m_hdrDisplayedFrame && IOSIsTenBitVideo(m_hdrDisplayedFrame->sourceBuffer) &&
       (m_hdrDisplayedFrame->metadata.transfer == 16 || m_hdrDisplayedFrame->metadata.transfer == 18);
 }
 
@@ -1322,12 +1376,16 @@ void ScheduleHDRDelivery()
 {
   const BOOL sourceHDR = [self foldSourceIsHDR];
   const BOOL enabled = sourceHDR && [self foldHDREnabled];
+  if (hdrOutputEnabled.exchange([self foldHDREnabled]) != [self foldHDREnabled])
+    ++hdrRangeGeneration;
   if (@available(iOS 26.0, *))
   {
     // AVSampleBufferDisplayLayer is not always tagged as HDR automatically.
     // The range preference alone does not activate EDR for untagged contents.
-    // Keep the source headroom when HDR is off so CoreAnimation can tone-map.
-    m_hdrLayer.contentsHeadroom = sourceHDR ? IOSHDRContentHeadroom(m_hdrDisplayedFrame->metadata) : 1.0;
+    // SDR is explicitly converted before enqueueing, including in PiP. The
+    // layer preference alone does not reliably cap AVFoundation's video path.
+    m_hdrLayer.contentsHeadroom = sourceHDR && !m_hdrDisplayedFrame->sdrConverted ?
+        IOSHDRContentHeadroom(m_hdrDisplayedFrame->metadata) : 1.0;
     m_hdrLayer.preferredDynamicRange = enabled ? CADynamicRangeHigh : CADynamicRangeStandard;
   }
   else if (@available(iOS 17.0, *))
@@ -1342,6 +1400,12 @@ void ScheduleHDRDelivery()
     return;
   [NSUserDefaults.standardUserDefaults setBool:sender.on forKey:@"DuoHDREnabled"];
   [self applyHDRPreference];
+  // Reprocess the original decoded surface as well when playback is paused.
+  // Keep the source separate from SDR/PiP outputs to avoid applying a second
+  // tone map, and reject in-flight frames from the previous preference.
+  const auto frame = m_hdrDisplayedFrame;
+  IOSPresentHDRVideo(frame->session, frame->sourceBuffer, frame->metadata, frame->source,
+      frame->destination, frame->orientation, frame->subtitles);
   [self renderFoldSettings];
 }
 

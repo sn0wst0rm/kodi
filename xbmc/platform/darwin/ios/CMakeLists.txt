@@ -1,5 +1,6 @@
 set(SOURCES IOSEAGLView.mm
             IOSVideoCompositor.mm
+            IOSVideoToneMap.mm
             IOSExternalTouchController.mm
             IOSKeyboardView.mm
             IOSScreenManager.mm

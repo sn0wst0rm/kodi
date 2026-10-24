@@ -42,7 +42,9 @@ inline double IOSHDRContentHeadroom(const IOSHDRVideoMetadata& metadata)
             (uint32_t(metadata.mastering[17]) << 16) |
             (uint32_t(metadata.mastering[18]) << 8) | metadata.mastering[19]) / 10000.0;
   if (peak <= 0) peak = 1000.0; // conservative PQ/HLG fallback without metadata
-  return std::clamp(peak / 203.0, 1.0, 10000.0 / 203.0);
+  // Native Apple PQ video maps 100 nit reference white to EDR 1.0.
+  // 203 nits is HDR diffuse white, not the reference of this video pipeline.
+  return std::clamp(peak / 100.0, 1.0, 100.0);
 }
 
 // Only decoded, IOSurface-backed buffers are passed to AVFoundation. Kodi
@@ -58,6 +60,9 @@ void IOSEndHDRVideo(uint64_t session);
 bool IOSIsPictureInPictureActive();
 bool IOSNativeVideoRenderingActive();
 CVPixelBufferRef IOSCompositeVideo(CVPixelBufferRef video, const IOSSubtitleBitmap& subtitles);
+// Returns an owned, 10-bit BT.709 surface, or nullptr with a VideoToolbox error.
+// Calls must be serialised on the native-video delivery queue.
+CVPixelBufferRef IOSConvertVideoToSDR(CVPixelBufferRef video, int32_t* error);
 
 void IOSDeleteVideoTexture(unsigned int texture);
 void IOSDrainVideoTextures();
