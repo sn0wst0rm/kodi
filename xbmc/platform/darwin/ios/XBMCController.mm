@@ -50,6 +50,7 @@
 #import "platform/darwin/ios-common/DarwinEmbedNowPlayingInfoManager.h"
 #import "platform/darwin/ios/IOSEAGLView.h"
 #include "platform/darwin/ios/IOSHDRVideo.h"
+#include "platform/darwin/ios/IOSVideoFormatCache.h"
 #include "platform/darwin/ios/IOSPlaybackPolicy.h"
 #import "platform/darwin/ios/IOSScreenManager.h"
 #import "platform/darwin/ios/XBMCApplication.h"
@@ -323,6 +324,7 @@ public:
   UIView* m_hdrCanvas;
   UIView* m_hdrCrop;
   AVSampleBufferDisplayLayer* m_hdrLayer;
+  IOSVideoFormatCache m_hdrFormat;
   std::shared_ptr<IOSHDRFrame> m_hdrDisplayedFrame;
   std::shared_ptr<IOSHDRFrame> m_hdrEnqueuedFrame;
   uint64_t m_hdrPresentedSession;
@@ -481,6 +483,7 @@ void ScheduleHDRDelivery()
   [self updateNativeVideoComposition];
   m_hdrDisplayedFrame.reset();
   m_hdrEnqueuedFrame.reset();
+  m_hdrFormat.Reset();
   m_hdrPresentedSession = 0;
   m_hdrFailed = NO;
   m_glView.opaque = YES;
@@ -727,12 +730,11 @@ void ScheduleHDRDelivery()
       CVPixelBufferRef pixel = frame->buffer;
       CMVideoFormatDescriptionRef format = nullptr;
       CMSampleBufferRef sample = nullptr;
-      OSStatus result = CMVideoFormatDescriptionCreateForImageBuffer(nullptr, pixel, &format);
+      OSStatus result = m_hdrFormat.Get(pixel, &format);
       if (result == noErr)
       {
         CMSampleTimingInfo timing = {kCMTimeInvalid, CMTimebaseGetTime(m_pipTimebase), kCMTimeInvalid};
         result = CMSampleBufferCreateReadyWithImageBuffer(nullptr, pixel, format, &timing, &sample);
-        CFRelease(format);
       }
       if (result == noErr)
       {
@@ -743,10 +745,15 @@ void ScheduleHDRDelivery()
         nativeEnqueuedFrames.fetch_add(1, std::memory_order_relaxed);
         CFRelease(sample);
         m_hdrEnqueuedFrame = frame;
-        m_hdrCanvas.hidden = NO;
-      [self updateNativeVideoComposition];
-        m_glView.opaque = NO;
-        m_glView.layer.opaque = NO;
+        if (m_hdrCanvas.hidden)
+        {
+          m_hdrCanvas.hidden = NO;
+          [self updateNativeVideoComposition];
+        }
+        if (m_glView.opaque)
+          m_glView.opaque = NO;
+        if (m_glView.layer.opaque)
+          m_glView.layer.opaque = NO;
       }
       else if (!m_hdrFailed)
       {

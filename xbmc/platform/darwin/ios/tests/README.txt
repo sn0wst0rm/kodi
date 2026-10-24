@@ -27,3 +27,8 @@ Limitations: native path requires an actual VideoToolbox-decoded buffer (iOS17+)
 Unsupported hardware codecs and interlaced/software fallback do not gain PiP.
 Native GL capture is unsupported. Dolby Vision profile/enhancement-layer output
 and PiP-specific dynamic metadata behaviour have not been verified.
+
+VideoFormatCache verifies that format reuse preserves image identity (no pixel
+copy), invalidates for resize/SDR/PQ/HLG and mastering metadata changes, and resets
+between sessions. Its microbenchmark isolates format-description allocation and
+matching; it does not include the native renderer's IPC or infer battery savings.

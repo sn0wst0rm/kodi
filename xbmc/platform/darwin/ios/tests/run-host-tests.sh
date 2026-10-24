@@ -5,6 +5,10 @@ IOS_DIR=$(dirname "$TEST_DIR")
 TEST_OUTPUT=$(mktemp -d "${TMPDIR:-/tmp}/kodi-ios-pip-tests.XXXXXX")
 trap 'rm -rf "$TEST_OUTPUT"' EXIT
 xcrun --sdk macosx clang++ -O2 -std=c++17 -I "$IOS_DIR" \
+  "$TEST_DIR/VideoFormatCache.mm" -framework CoreMedia -framework CoreVideo \
+  -framework Foundation -o "$TEST_OUTPUT/video-format-cache"
+"$TEST_OUTPUT/video-format-cache"
+xcrun --sdk macosx clang++ -O2 -std=c++17 -I "$IOS_DIR" \
   "$TEST_DIR/PlaybackPolicy.cpp" -o "$TEST_OUTPUT/playback-policy"
 "$TEST_OUTPUT/playback-policy"
 xcrun --sdk macosx clang++ -O2 -std=c++17 -I "$IOS_DIR" \
