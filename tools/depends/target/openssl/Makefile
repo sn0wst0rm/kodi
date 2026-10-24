@@ -25,6 +25,7 @@ ifeq ($(OS), linux)
 else ifeq ($(OS), wasm)
   CONFIGURE=./Configure no-shared no-asm no-tests no-module no-async no-afalgeng --prefix=$(PREFIX) --libdir=lib linux-generic32
 else
+  ASMFLAG=no-asm
   ifeq ($(OS), android)
     TARGETOPT=--with-zlib-include=$(PREFIX)/include --with-zlib-lib=$(PREFIX)/lib -U__ANDROID_API__ -D__ANDROID_API__=$(NDK_LEVEL)
 
@@ -37,6 +38,7 @@ else
     endif
   endif
   ifeq ($(OS), darwin_embedded)
+    ASMFLAG=
     # LLVM 15 has raised this to error by default. drop back to warning
     CFLAGS+= -Wno-error=implicit-int
     export SDKROOT CFLAGS
@@ -53,8 +55,8 @@ else
   endif
 
   # Openssl 3.2.0 allows no-apps no-docs as options. Use when we update further
-  # We explicitly use no-asm as there is a symbol clash with gnutls
-  CONFIGURE=./Configure no-shared zlib no-tests no-asm no-module  $(TARGETOPT) --prefix=$(PREFIX) $(OPENSSLPLATFORM)
+  # Keep assembly disabled by default for targets with GnuTLS symbol clashes.
+  CONFIGURE=./Configure no-shared zlib no-tests $(ASMFLAG) no-module  $(TARGETOPT) --prefix=$(PREFIX) $(OPENSSLPLATFORM)
 endif
 
 export CC CXX AR RANLIB

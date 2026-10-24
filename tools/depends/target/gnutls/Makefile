@@ -1,7 +1,8 @@
 include ../../Makefile.include GNUTLS-VERSION ../../download-files.include
 DEPS = ../../Makefile.include Makefile ../../download-files.include \
                               0001-clang-lt-17-fix.patch \
-                              0002-makefile-am-wasm-fix.patch
+                              0002-makefile-am-wasm-fix.patch \
+                              0003-namespace-aarch64-primitives.patch
 
 # disable rpl_malloc and rpl_realloc symbols in glib
 # causes linking errors in libmicrohttpd and ffmpeg with missing symbols
@@ -48,6 +49,7 @@ all: .installed-$(PLATFORM)
 	cd $(PLATFORM); $(ARCHIVE_TOOL) $(ARCHIVE_TOOL_FLAGS) $(TARBALLS_LOCATION)/$(ARCHIVE)
 	cd $(PLATFORM); patch -p1 -i ../0001-clang-lt-17-fix.patch
 	cd $(PLATFORM); patch -p1 -i ../0002-makefile-am-wasm-fix.patch
+	cd $(PLATFORM); patch -p1 -i ../0003-namespace-aarch64-primitives.patch
 	cd $(PLATFORM); $(AUTORECONF) -vif
 	cd $(PLATFORM); $(CONFIGURE)
 	touch $@

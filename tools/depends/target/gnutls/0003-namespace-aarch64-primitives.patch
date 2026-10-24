@@ -1,0 +1,709 @@
+Subject: Namespace GnuTLS AArch64 primitives to coexist with OpenSSL
+
+Keep both libraries' accelerated implementations when statically linked.
+
+--- a/lib/accelerated/aarch64/aes-aarch64.h
++++ b/lib/accelerated/aarch64/aes-aarch64.h
+@@ -35,16 +35,16 @@
+ 	return 0;
+ }
+ 
+-int aes_v8_set_encrypt_key(const unsigned char *userKey, int bits,
++int gnutls_aes_v8_set_encrypt_key(const unsigned char *userKey, int bits,
+ 			   AES_KEY *key);
+-int aes_v8_set_decrypt_key(const unsigned char *userKey, int bits,
++int gnutls_aes_v8_set_decrypt_key(const unsigned char *userKey, int bits,
+ 			   AES_KEY *key);
+-void aes_v8_cbc_encrypt(const unsigned char *in, unsigned char *out,
++void gnutls_aes_v8_cbc_encrypt(const unsigned char *in, unsigned char *out,
+ 			size_t length, const AES_KEY *key, unsigned char *ivec,
+ 			int enc);
+-void aes_v8_encrypt(const unsigned char *in, unsigned char *out,
++void gnutls_aes_v8_encrypt(const unsigned char *in, unsigned char *out,
+ 		    const AES_KEY *key);
+-void aes_v8_decrypt(const unsigned char *in, unsigned char *out,
++void gnutls_aes_v8_decrypt(const unsigned char *in, unsigned char *out,
+ 		    const AES_KEY *key);
+ 
+ extern const gnutls_crypto_cipher_st _gnutls_aes_gcm_aarch64;
+--- a/lib/accelerated/aarch64/aes-cbc-aarch64.c
++++ b/lib/accelerated/aarch64/aes-cbc-aarch64.c
+@@ -68,10 +68,10 @@
+ 	CHECK_AES_KEYSIZE(keysize);
+ 
+ 	if (ctx->enc)
+-		ret = aes_v8_set_encrypt_key(userkey, keysize * 8,
++		ret = gnutls_aes_v8_set_encrypt_key(userkey, keysize * 8,
+ 					     ALIGN16(&ctx->expanded_key));
+ 	else
+-		ret = aes_v8_set_decrypt_key(userkey, keysize * 8,
++		ret = gnutls_aes_v8_set_decrypt_key(userkey, keysize * 8,
+ 					     ALIGN16(&ctx->expanded_key));
+ 
+ 	if (ret != 0)
+@@ -91,7 +91,7 @@
+ 	if (unlikely(dst_size < src_size))
+ 		return gnutls_assert_val(GNUTLS_E_SHORT_MEMORY_BUFFER);
+ 
+-	aes_v8_cbc_encrypt(src, dst, src_size, ALIGN16(&ctx->expanded_key),
++	gnutls_aes_v8_cbc_encrypt(src, dst, src_size, ALIGN16(&ctx->expanded_key),
+ 			   ctx->iv, 1);
+ 	return 0;
+ }
+@@ -107,7 +107,7 @@
+ 	if (unlikely(dst_size < src_size))
+ 		return gnutls_assert_val(GNUTLS_E_SHORT_MEMORY_BUFFER);
+ 
+-	aes_v8_cbc_encrypt(src, dst, src_size, ALIGN16(&ctx->expanded_key),
++	gnutls_aes_v8_cbc_encrypt(src, dst, src_size, ALIGN16(&ctx->expanded_key),
+ 			   ctx->iv, 0);
+ 
+ 	return 0;
+--- a/lib/accelerated/aarch64/aes-ccm-aarch64.c
++++ b/lib/accelerated/aarch64/aes-ccm-aarch64.c
+@@ -51,7 +51,7 @@
+ 	unsigned i;
+ 
+ 	for (i = 0; i < length; i += 16) {
+-		aes_v8_encrypt(src, dst, ctx);
++		gnutls_aes_v8_encrypt(src, dst, ctx);
+ 		src += 16;
+ 		dst += 16;
+ 	}
+@@ -82,7 +82,7 @@
+ 
+ 	CHECK_AES_KEYSIZE(length);
+ 
+-	aes_v8_set_encrypt_key(key, length * 8, &ctx->key);
++	gnutls_aes_v8_set_encrypt_key(key, length * 8, &ctx->key);
+ 
+ 	return 0;
+ }
+--- a/lib/accelerated/aarch64/aes-gcm-aarch64.c
++++ b/lib/accelerated/aarch64/aes-gcm-aarch64.c
+@@ -65,10 +65,10 @@
+ 	size_t rekey_counter;
+ };
+ 
+-void gcm_init_v8(u128 Htable[16], const uint64_t Xi[2]);
+-void gcm_ghash_v8(uint64_t Xi[2], const u128 Htable[16], const uint8_t *inp,
++void gnutls_gcm_init_v8(u128 Htable[16], const uint64_t Xi[2]);
++void gnutls_gcm_ghash_v8(uint64_t Xi[2], const u128 Htable[16], const uint8_t *inp,
+ 		  size_t len);
+-void gcm_gmult_v8(uint64_t Xi[2], const u128 Htable[16]);
++void gnutls_gcm_gmult_v8(uint64_t Xi[2], const u128 Htable[16]);
+ 
+ static void aes_gcm_deinit(void *_ctx)
+ {
+@@ -104,17 +104,17 @@
+ 
+ 	CHECK_AES_KEYSIZE(keysize);
+ 
+-	ret = aes_v8_set_encrypt_key(userkey, keysize * 8,
++	ret = gnutls_aes_v8_set_encrypt_key(userkey, keysize * 8,
+ 				     ALIGN16(&ctx->expanded_key));
+ 	if (ret != 0)
+ 		return gnutls_assert_val(GNUTLS_E_ENCRYPTION_FAILED);
+ 
+-	aes_v8_encrypt(ctx->gcm.H.c, ctx->gcm.H.c, ALIGN16(&ctx->expanded_key));
++	gnutls_aes_v8_encrypt(ctx->gcm.H.c, ctx->gcm.H.c, ALIGN16(&ctx->expanded_key));
+ 
+ 	ctx->gcm.H.u[0] = bswap_64(ctx->gcm.H.u[0]);
+ 	ctx->gcm.H.u[1] = bswap_64(ctx->gcm.H.u[1]);
+ 
+-	gcm_init_v8(ctx->gcm.Htable, ctx->gcm.H.u);
++	gnutls_gcm_init_v8(ctx->gcm.Htable, ctx->gcm.H.u);
+ 	ctx->rekey_counter = 0;
+ 
+ 	return 0;
+@@ -136,7 +136,7 @@
+ 	ctx->gcm.Yi.c[GCM_BLOCK_SIZE - 2] = 0;
+ 	ctx->gcm.Yi.c[GCM_BLOCK_SIZE - 1] = 1;
+ 
+-	aes_v8_encrypt(ctx->gcm.Yi.c, ctx->gcm.EK0.c,
++	gnutls_aes_v8_encrypt(ctx->gcm.Yi.c, ctx->gcm.EK0.c,
+ 		       ALIGN16(&ctx->expanded_key));
+ 	ctx->gcm.Yi.c[GCM_BLOCK_SIZE - 1] = 2;
+ 	ctx->finished = 0;
+@@ -152,11 +152,11 @@
+ 	size_t aligned_size = src_size - rest;
+ 
+ 	if (aligned_size > 0)
+-		gcm_ghash_v8(ctx->gcm.Xi.u, ctx->gcm.Htable, src, aligned_size);
++		gnutls_gcm_ghash_v8(ctx->gcm.Xi.u, ctx->gcm.Htable, src, aligned_size);
+ 
+ 	if (rest > 0) {
+ 		memxor(ctx->gcm.Xi.c, src + aligned_size, rest);
+-		gcm_gmult_v8(ctx->gcm.Xi.u, ctx->gcm.Htable);
++		gnutls_gcm_gmult_v8(ctx->gcm.Xi.u, ctx->gcm.Htable);
+ 	}
+ }
+ 
+@@ -172,7 +172,7 @@
+ 	memcpy(ctr, ivec, 16);
+ 
+ 	for (i = 0; i < blocks; i++) {
+-		aes_v8_encrypt(ctr, tmp, key);
++		gnutls_aes_v8_encrypt(ctr, tmp, key);
+ 		memxor3(out, tmp, in, 16);
+ 
+ 		out += 16;
+@@ -194,7 +194,7 @@
+ 	memcpy(ctr, ivec, 16);
+ 
+ 	for (i = 0; i < blocks; i++) {
+-		aes_v8_encrypt(ctr, out, key);
++		gnutls_aes_v8_encrypt(ctr, out, key);
+ 		memxor(out, in, 16);
+ 
+ 		out += 16;
+@@ -322,7 +322,7 @@
+ 	_gnutls_write_uint64(alen, buffer);
+ 	_gnutls_write_uint64(clen, &buffer[8]);
+ 
+-	gcm_ghash_v8(ctx->gcm.Xi.u, ctx->gcm.Htable, buffer, GCM_BLOCK_SIZE);
++	gnutls_gcm_ghash_v8(ctx->gcm.Xi.u, ctx->gcm.Htable, buffer, GCM_BLOCK_SIZE);
+ 
+ 	ctx->gcm.Xi.u[0] ^= ctx->gcm.EK0.u[0];
+ 	ctx->gcm.Xi.u[1] ^= ctx->gcm.EK0.u[1];
+--- a/lib/accelerated/aarch64/elf/aes-aarch64.s
++++ b/lib/accelerated/aarch64/elf/aes-aarch64.s
+@@ -54,10 +54,10 @@
+ .long 0x0c0f0e0d,0x0c0f0e0d,0x0c0f0e0d,0x0c0f0e0d
+ .long 0x1b,0x1b,0x1b,0x1b
+ 
+-.globl aes_v8_set_encrypt_key
+-.type aes_v8_set_encrypt_key,%function
++.globl gnutls_aes_v8_set_encrypt_key
++.type gnutls_aes_v8_set_encrypt_key,%function
+ .align 5
+-aes_v8_set_encrypt_key:
++gnutls_aes_v8_set_encrypt_key:
+ .Lenc_key:
+ 
+ 
+@@ -226,12 +226,12 @@
+  mov x0,x3
+  ldr x29,[sp],#16
+  ret
+-.size aes_v8_set_encrypt_key,.-aes_v8_set_encrypt_key
+-
+-.globl aes_v8_set_decrypt_key
+-.type aes_v8_set_decrypt_key,%function
++.size gnutls_aes_v8_set_encrypt_key,.-gnutls_aes_v8_set_encrypt_key
++
++.globl gnutls_aes_v8_set_decrypt_key
++.type gnutls_aes_v8_set_decrypt_key,%function
+ .align 5
+-aes_v8_set_decrypt_key:
++gnutls_aes_v8_set_decrypt_key:
+ 
+  stp x29,x30,[sp,#-16]!
+  add x29,sp,#0
+@@ -268,11 +268,11 @@
+  ldp x29,x30,[sp],#16
+ 
+  ret
+-.size aes_v8_set_decrypt_key,.-aes_v8_set_decrypt_key
+-.globl aes_v8_encrypt
+-.type aes_v8_encrypt,%function
++.size gnutls_aes_v8_set_decrypt_key,.-gnutls_aes_v8_set_decrypt_key
++.globl gnutls_aes_v8_encrypt
++.type gnutls_aes_v8_encrypt,%function
+ .align 5
+-aes_v8_encrypt:
++gnutls_aes_v8_encrypt:
+ 
+  ldr w3,[x2,#240]
+  ld1 {v0.4s},[x2],#16
+@@ -298,11 +298,11 @@
+ 
+  st1 {v2.16b},[x1]
+  ret
+-.size aes_v8_encrypt,.-aes_v8_encrypt
+-.globl aes_v8_decrypt
+-.type aes_v8_decrypt,%function
++.size gnutls_aes_v8_encrypt,.-gnutls_aes_v8_encrypt
++.globl gnutls_aes_v8_decrypt
++.type gnutls_aes_v8_decrypt,%function
+ .align 5
+-aes_v8_decrypt:
++gnutls_aes_v8_decrypt:
+ 
+  ldr w3,[x2,#240]
+  ld1 {v0.4s},[x2],#16
+@@ -328,11 +328,11 @@
+ 
+  st1 {v2.16b},[x1]
+  ret
+-.size aes_v8_decrypt,.-aes_v8_decrypt
+-.globl aes_v8_ecb_encrypt
+-.type aes_v8_ecb_encrypt,%function
++.size gnutls_aes_v8_decrypt,.-gnutls_aes_v8_decrypt
++.globl gnutls_aes_v8_ecb_encrypt
++.type gnutls_aes_v8_ecb_encrypt,%function
+ .align 5
+-aes_v8_ecb_encrypt:
++gnutls_aes_v8_ecb_encrypt:
+ 
+  subs x2,x2,#16
+ 
+@@ -1075,11 +1075,11 @@
+  ldr x29,[sp],#16
+ .Lecb_Final_abort:
+  ret
+-.size aes_v8_ecb_encrypt,.-aes_v8_ecb_encrypt
+-.globl aes_v8_cbc_encrypt
+-.type aes_v8_cbc_encrypt,%function
++.size gnutls_aes_v8_ecb_encrypt,.-gnutls_aes_v8_ecb_encrypt
++.globl gnutls_aes_v8_cbc_encrypt
++.type gnutls_aes_v8_cbc_encrypt,%function
+ .align 5
+-aes_v8_cbc_encrypt:
++gnutls_aes_v8_cbc_encrypt:
+ 
+ 
+  stp x29,x30,[sp,#-16]!
+@@ -1552,11 +1552,11 @@
+ .Lcbc_abort:
+  ldr x29,[sp],#16
+  ret
+-.size aes_v8_cbc_encrypt,.-aes_v8_cbc_encrypt
+-.globl aes_v8_ctr32_encrypt_blocks
+-.type aes_v8_ctr32_encrypt_blocks,%function
++.size gnutls_aes_v8_cbc_encrypt,.-gnutls_aes_v8_cbc_encrypt
++.globl gnutls_aes_v8_ctr32_encrypt_blocks
++.type gnutls_aes_v8_ctr32_encrypt_blocks,%function
+ .align 5
+-aes_v8_ctr32_encrypt_blocks:
++gnutls_aes_v8_ctr32_encrypt_blocks:
+ 
+ 
+  stp x29,x30,[sp,#-16]!
+@@ -1903,11 +1903,11 @@
+ .Lctr32_done:
+  ldr x29,[sp],#16
+  ret
+-.size aes_v8_ctr32_encrypt_blocks,.-aes_v8_ctr32_encrypt_blocks
+-.globl aes_v8_xts_encrypt
+-.type aes_v8_xts_encrypt,%function
++.size gnutls_aes_v8_ctr32_encrypt_blocks,.-gnutls_aes_v8_ctr32_encrypt_blocks
++.globl gnutls_aes_v8_xts_encrypt
++.type gnutls_aes_v8_xts_encrypt,%function
+ .align 5
+-aes_v8_xts_encrypt:
++gnutls_aes_v8_xts_encrypt:
+ 
+  cmp x2,#16
+ 
+@@ -2545,11 +2545,11 @@
+  ldp x19,x20,[sp],#64
+ .Lxts_enc_final_abort:
+  ret
+-.size aes_v8_xts_encrypt,.-aes_v8_xts_encrypt
+-.globl aes_v8_xts_decrypt
+-.type aes_v8_xts_decrypt,%function
++.size gnutls_aes_v8_xts_encrypt,.-gnutls_aes_v8_xts_encrypt
++.globl gnutls_aes_v8_xts_decrypt
++.type gnutls_aes_v8_xts_decrypt,%function
+ .align 5
+-aes_v8_xts_decrypt:
++gnutls_aes_v8_xts_decrypt:
+ 
+  cmp x2,#16
+ 
+@@ -3232,5 +3232,5 @@
+ 
+ .Lxts_dec_final_abort:
+  ret
+-.size aes_v8_xts_decrypt,.-aes_v8_xts_decrypt
++.size gnutls_aes_v8_xts_decrypt,.-gnutls_aes_v8_xts_decrypt
+ .section .note.GNU-stack,"",%progbits
+--- a/lib/accelerated/aarch64/elf/ghash-aarch64.s
++++ b/lib/accelerated/aarch64/elf/ghash-aarch64.s
+@@ -48,10 +48,10 @@
+ 
+ .arch armv8-a+crypto
+ .text
+-.globl gcm_init_v8
+-.type gcm_init_v8,%function
+-.align 4
+-gcm_init_v8:
++.globl gnutls_gcm_init_v8
++.type gnutls_gcm_init_v8,%function
++.align 4
++gnutls_gcm_init_v8:
+ 
+  ld1 {v17.2d},[x1]
+  movi v19.16b,#0xe1
+@@ -226,11 +226,11 @@
+  ext v30.16b,v16.16b,v17.16b,#8
+  st1 {v29.2d,v30.2d,v31.2d},[x0]
+  ret
+-.size gcm_init_v8,.-gcm_init_v8
+-.globl gcm_gmult_v8
+-.type gcm_gmult_v8,%function
+-.align 4
+-gcm_gmult_v8:
++.size gnutls_gcm_init_v8,.-gnutls_gcm_init_v8
++.globl gnutls_gcm_gmult_v8
++.type gnutls_gcm_gmult_v8,%function
++.align 4
++gnutls_gcm_gmult_v8:
+ 
+  ld1 {v17.2d},[x0]
+  movi v19.16b,#0xe1
+@@ -268,11 +268,11 @@
+  st1 {v0.2d},[x0]
+ 
+  ret
+-.size gcm_gmult_v8,.-gcm_gmult_v8
+-.globl gcm_ghash_v8
+-.type gcm_ghash_v8,%function
+-.align 4
+-gcm_ghash_v8:
++.size gnutls_gcm_gmult_v8,.-gnutls_gcm_gmult_v8
++.globl gnutls_gcm_ghash_v8
++.type gnutls_gcm_ghash_v8,%function
++.align 4
++gnutls_gcm_ghash_v8:
+ 
+  cmp x3,#64
+  b.hs .Lgcm_ghash_v8_4x
+@@ -394,7 +394,7 @@
+  st1 {v0.2d},[x0]
+ 
+  ret
+-.size gcm_ghash_v8,.-gcm_ghash_v8
++.size gnutls_gcm_ghash_v8,.-gnutls_gcm_ghash_v8
+ .type gcm_ghash_v8_4x,%function
+ .align 4
+ gcm_ghash_v8_4x:
+--- a/lib/accelerated/aarch64/elf/sha1-armv8.s
++++ b/lib/accelerated/aarch64/elf/sha1-armv8.s
+@@ -51,10 +51,10 @@
+ 
+ .text
+ 
+-.globl sha1_block_data_order
+-.type sha1_block_data_order,%function
++.globl gnutls_sha1_block_data_order
++.type gnutls_sha1_block_data_order,%function
+ .align 6
+-sha1_block_data_order:
++gnutls_sha1_block_data_order:
+ 
+  adrp x16,_gnutls_arm_cpuid_s
+  ldr w16,[x16,#:lo12:_gnutls_arm_cpuid_s]
+@@ -1116,7 +1116,7 @@
+  ldp x27,x28,[sp,#80]
+  ldr x29,[sp],#96
+  ret
+-.size sha1_block_data_order,.-sha1_block_data_order
++.size gnutls_sha1_block_data_order,.-gnutls_sha1_block_data_order
+ .type sha1_block_armv8,%function
+ .align 6
+ sha1_block_armv8:
+--- a/lib/accelerated/aarch64/elf/sha256-armv8.s
++++ b/lib/accelerated/aarch64/elf/sha256-armv8.s
+@@ -52,10 +52,10 @@
+ 
+ .text
+ 
+-.globl sha256_block_data_order
+-.type sha256_block_data_order,%function
++.globl gnutls_sha256_block_data_order
++.type gnutls_sha256_block_data_order,%function
+ .align 6
+-sha256_block_data_order:
++gnutls_sha256_block_data_order:
+ 
+ 
+  adrp x16,_gnutls_arm_cpuid_s
+@@ -1027,7 +1027,7 @@
+  ldp x29,x30,[sp],#128
+ 
+  ret
+-.size sha256_block_data_order,.-sha256_block_data_order
++.size gnutls_sha256_block_data_order,.-gnutls_sha256_block_data_order
+ 
+ .align 6
+ .type .LK256,%object
+--- a/lib/accelerated/aarch64/elf/sha512-armv8.s
++++ b/lib/accelerated/aarch64/elf/sha512-armv8.s
+@@ -52,10 +52,10 @@
+ 
+ .text
+ 
+-.globl sha512_block_data_order
+-.type sha512_block_data_order,%function
++.globl gnutls_sha512_block_data_order
++.type gnutls_sha512_block_data_order,%function
+ .align 6
+-sha512_block_data_order:
++gnutls_sha512_block_data_order:
+ 
+ 
+  adrp x16,_gnutls_arm_cpuid_s
+@@ -1025,7 +1025,7 @@
+  ldp x29,x30,[sp],#128
+ 
+  ret
+-.size sha512_block_data_order,.-sha512_block_data_order
++.size gnutls_sha512_block_data_order,.-gnutls_sha512_block_data_order
+ 
+ .align 6
+ .type .LK512,%object
+--- a/lib/accelerated/aarch64/macosx/aes-aarch64.s
++++ b/lib/accelerated/aarch64/macosx/aes-aarch64.s
+@@ -53,10 +53,10 @@
+ .long 0x0c0f0e0d,0x0c0f0e0d,0x0c0f0e0d,0x0c0f0e0d
+ .long 0x1b,0x1b,0x1b,0x1b
+ 
+-.globl _aes_v8_set_encrypt_key
++.globl _gnutls_aes_v8_set_encrypt_key
+ 
+ .align 5
+-_aes_v8_set_encrypt_key:
++_gnutls_aes_v8_set_encrypt_key:
+ Lenc_key:
+ 
+ 
+@@ -227,10 +227,10 @@
+  ret
+ 
+ 
+-.globl _aes_v8_set_decrypt_key
++.globl _gnutls_aes_v8_set_decrypt_key
+ 
+ .align 5
+-_aes_v8_set_decrypt_key:
++_gnutls_aes_v8_set_decrypt_key:
+ 
+  stp x29,x30,[sp,#-16]!
+  add x29,sp,#0
+@@ -268,10 +268,10 @@
+ 
+  ret
+ 
+-.globl _aes_v8_encrypt
++.globl _gnutls_aes_v8_encrypt
+ 
+ .align 5
+-_aes_v8_encrypt:
++_gnutls_aes_v8_encrypt:
+ 
+  ldr w3,[x2,#240]
+  ld1 {v0.4s},[x2],#16
+@@ -298,10 +298,10 @@
+  st1 {v2.16b},[x1]
+  ret
+ 
+-.globl _aes_v8_decrypt
++.globl _gnutls_aes_v8_decrypt
+ 
+ .align 5
+-_aes_v8_decrypt:
++_gnutls_aes_v8_decrypt:
+ 
+  ldr w3,[x2,#240]
+  ld1 {v0.4s},[x2],#16
+@@ -328,10 +328,10 @@
+  st1 {v2.16b},[x1]
+  ret
+ 
+-.globl _aes_v8_ecb_encrypt
++.globl _gnutls_aes_v8_ecb_encrypt
+ 
+ .align 5
+-_aes_v8_ecb_encrypt:
++_gnutls_aes_v8_ecb_encrypt:
+ 
+  subs x2,x2,#16
+ 
+@@ -1075,10 +1075,10 @@
+ Lecb_Final_abort:
+  ret
+ 
+-.globl _aes_v8_cbc_encrypt
++.globl _gnutls_aes_v8_cbc_encrypt
+ 
+ .align 5
+-_aes_v8_cbc_encrypt:
++_gnutls_aes_v8_cbc_encrypt:
+ 
+ 
+  stp x29,x30,[sp,#-16]!
+@@ -1552,10 +1552,10 @@
+  ldr x29,[sp],#16
+  ret
+ 
+-.globl _aes_v8_ctr32_encrypt_blocks
++.globl _gnutls_aes_v8_ctr32_encrypt_blocks
+ 
+ .align 5
+-_aes_v8_ctr32_encrypt_blocks:
++_gnutls_aes_v8_ctr32_encrypt_blocks:
+ 
+ 
+  stp x29,x30,[sp,#-16]!
+@@ -1903,10 +1903,10 @@
+  ldr x29,[sp],#16
+  ret
+ 
+-.globl _aes_v8_xts_encrypt
++.globl _gnutls_aes_v8_xts_encrypt
+ 
+ .align 5
+-_aes_v8_xts_encrypt:
++_gnutls_aes_v8_xts_encrypt:
+ 
+  cmp x2,#16
+ 
+@@ -2545,10 +2545,10 @@
+ Lxts_enc_final_abort:
+  ret
+ 
+-.globl _aes_v8_xts_decrypt
++.globl _gnutls_aes_v8_xts_decrypt
+ 
+ .align 5
+-_aes_v8_xts_decrypt:
++_gnutls_aes_v8_xts_decrypt:
+ 
+  cmp x2,#16
+ 
+--- a/lib/accelerated/aarch64/macosx/ghash-aarch64.s
++++ b/lib/accelerated/aarch64/macosx/ghash-aarch64.s
+@@ -47,10 +47,10 @@
+ 
+ 
+ .text
+-.globl _gcm_init_v8
+-
+-.align 4
+-_gcm_init_v8:
++.globl _gnutls_gcm_init_v8
++
++.align 4
++_gnutls_gcm_init_v8:
+ 
+  ld1 {v17.2d},[x1]
+  movi v19.16b,#0xe1
+@@ -226,10 +226,10 @@
+  st1 {v29.2d,v30.2d,v31.2d},[x0]
+  ret
+ 
+-.globl _gcm_gmult_v8
+-
+-.align 4
+-_gcm_gmult_v8:
++.globl _gnutls_gcm_gmult_v8
++
++.align 4
++_gnutls_gcm_gmult_v8:
+ 
+  ld1 {v17.2d},[x0]
+  movi v19.16b,#0xe1
+@@ -268,10 +268,10 @@
+ 
+  ret
+ 
+-.globl _gcm_ghash_v8
+-
+-.align 4
+-_gcm_ghash_v8:
++.globl _gnutls_gcm_ghash_v8
++
++.align 4
++_gnutls_gcm_ghash_v8:
+ 
+  cmp x3,#64
+  b.hs Lgcm_ghash_v8_4x
+--- a/lib/accelerated/aarch64/macosx/sha1-armv8.s
++++ b/lib/accelerated/aarch64/macosx/sha1-armv8.s
+@@ -50,10 +50,10 @@
+ 
+ .text
+ 
+-.globl _sha1_block_data_order
++.globl _gnutls_sha1_block_data_order
+ 
+ .align 6
+-_sha1_block_data_order:
++_gnutls_sha1_block_data_order:
+ 
+  adrp x16,__gnutls_arm_cpuid_s@PAGE
+  ldr w16,[x16,__gnutls_arm_cpuid_s@PAGEOFF]
+--- a/lib/accelerated/aarch64/macosx/sha256-armv8.s
++++ b/lib/accelerated/aarch64/macosx/sha256-armv8.s
+@@ -51,10 +51,10 @@
+ 
+ .text
+ 
+-.globl _sha256_block_data_order
++.globl _gnutls_sha256_block_data_order
+ 
+ .align 6
+-_sha256_block_data_order:
++_gnutls_sha256_block_data_order:
+ 
+ 
+  adrp x16,__gnutls_arm_cpuid_s@PAGE
+--- a/lib/accelerated/aarch64/macosx/sha512-armv8.s
++++ b/lib/accelerated/aarch64/macosx/sha512-armv8.s
+@@ -51,10 +51,10 @@
+ 
+ .text
+ 
+-.globl _sha512_block_data_order
++.globl _gnutls_sha512_block_data_order
+ 
+ .align 6
+-_sha512_block_data_order:
++_gnutls_sha512_block_data_order:
+ 
+ 
+  adrp x16,__gnutls_arm_cpuid_s@PAGE
+--- a/lib/accelerated/aarch64/sha-aarch64.c
++++ b/lib/accelerated/aarch64/sha-aarch64.c
+@@ -33,9 +33,9 @@
+ #include "sha-aarch64.h"
+ #include "aarch64-common.h"
+ 
+-void sha1_block_data_order(void *c, const void *p, size_t len);
+-void sha256_block_data_order(void *c, const void *p, size_t len);
+-void sha512_block_data_order(void *c, const void *p, size_t len);
++void gnutls_sha1_block_data_order(void *c, const void *p, size_t len);
++void gnutls_sha256_block_data_order(void *c, const void *p, size_t len);
++void gnutls_sha512_block_data_order(void *c, const void *p, size_t len);
+ 
+ /* Can't use nettle_set_key_func as it doesn't have the second argument */
+ typedef void (*set_key_func)(void *, size_t, const uint8_t *);
+@@ -107,7 +107,7 @@
+ 	if (length > 0) {
+ 		t2 = length / SHA1_BLOCK_SIZE;
+ 
+-		sha1_block_data_order(&octx, data, t2);
++		gnutls_sha1_block_data_order(&octx, data, t2);
+ 
+ 		for (i = 0; i < t2; i++)
+ 			ctx->count++;
+@@ -159,7 +159,7 @@
+ 
+ 	if (length > 0) {
+ 		t2 = length / SHA1_BLOCK_SIZE;
+-		sha256_block_data_order(&octx, data, t2);
++		gnutls_sha256_block_data_order(&octx, data, t2);
+ 
+ 		for (i = 0; i < t2; i++)
+ 			ctx->count++;
+@@ -210,7 +210,7 @@
+ 
+ 	if (length > 0) {
+ 		t2 = length / SHA512_BLOCK_SIZE;
+-		sha512_block_data_order(&octx, data, t2);
++		gnutls_sha512_block_data_order(&octx, data, t2);
+ 
+ 		for (i = 0; i < t2; i++)
+ 			MD_INCR(ctx);
