@@ -1,0 +1,37 @@
+--- a/libswresample/resample_template.c
++++ b/libswresample/resample_template.c
+@@ -24,6 +24,10 @@
+  * audio resampling
+  * @author Michael Niedermayer <michaelni@gmx.at>
+  */
++
++#if defined(TEMPLATE_RESAMPLE_FLT) && ARCH_AARCH64 && HAVE_NEON
++#include <arm_neon.h>
++#endif
+ 
+ #if defined(TEMPLATE_RESAMPLE_DBL)
+ 
+@@ -163,8 +167,21 @@
+         FELEM *filter = ((FELEM *) c->filter_bank) + c->filter_alloc * index;
+         FELEM2 val = FOFFSET, v2 = FOFFSET;
+ 
+-        int i;
+-        for (i = 0; i < c->filter_length; i++) {
++        int i = 0;
++#if defined(TEMPLATE_RESAMPLE_FLT) && ARCH_AARCH64 && HAVE_NEON
++        /* Keep both phase filters and their interpolation unchanged. Unlike
++         * resample_common, this path had no AArch64 vector implementation. */
++        float32x4_t sum0 = vdupq_n_f32(0.0f);
++        float32x4_t sum1 = vdupq_n_f32(0.0f);
++        for (; i + 3 < c->filter_length; i += 4) {
++            float32x4_t samples = vld1q_f32(src + sample_index + i);
++            sum0 = vfmaq_f32(sum0, samples, vld1q_f32(filter + i));
++            sum1 = vfmaq_f32(sum1, samples, vld1q_f32(filter + c->filter_alloc + i));
++        }
++        val = vaddvq_f32(sum0);
++        v2 = vaddvq_f32(sum1);
++#endif
++        for (; i < c->filter_length; i++) {
+             val += src[sample_index + i] * (FELEM2)filter[i];
+             v2  += src[sample_index + i] * (FELEM2)filter[i + c->filter_alloc];
+         }
