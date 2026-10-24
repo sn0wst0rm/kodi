@@ -492,19 +492,14 @@ void ScheduleHDRDelivery()
     m_hdrStartedAt = CACurrentMediaTime();
     m_hdrReported = NO;
   }
-  [CATransaction begin];
-  [CATransaction setDisableActions:YES];
-  if (m_hdrCanvas.superview != m_glView.superview)
-    [m_glView.superview insertSubview:m_hdrCanvas belowSubview:m_glView];
-  m_hdrCanvas.transform = CGAffineTransformIdentity;
-  m_hdrCanvas.bounds = m_glView.bounds;
-  m_hdrCanvas.center = m_glView.center;
-  m_hdrCanvas.transform = m_glView.transform;
+  const CGRect canvasBounds = m_glView.bounds;
+  const CGPoint canvasCenter = m_glView.center;
+  const CGAffineTransform canvasTransform = m_glView.transform;
   const auto& frame = *m_hdrDisplayedFrame;
   CGRect dest = frame.destination;
-  CGSize canvas = m_glView.bounds.size;
-  m_hdrCrop.frame = CGRectMake(dest.origin.x * canvas.width, dest.origin.y * canvas.height,
-                               dest.size.width * canvas.width, dest.size.height * canvas.height);
+  const CGRect cropFrame = CGRectMake(dest.origin.x * canvasSize.width,
+      dest.origin.y * canvasSize.height, dest.size.width * canvasSize.width,
+      dest.size.height * canvasSize.height);
   CGRect source = frame.source;
   switch (frame.orientation % 360)
   {
@@ -520,14 +515,50 @@ void ScheduleHDRDelivery()
                           source.size.height, source.size.width);
       break;
   }
-  CGSize full = CGSizeMake(m_hdrCrop.bounds.size.width / source.size.width,
-                           m_hdrCrop.bounds.size.height / source.size.height);
+  CGSize full = CGSizeMake(cropFrame.size.width / source.size.width,
+                           cropFrame.size.height / source.size.height);
   BOOL quarterTurn = (frame.orientation % 180) != 0;
-  m_hdrLayer.bounds = CGRectMake(0, 0, quarterTurn ? full.height : full.width,
-                                quarterTurn ? full.width : full.height);
-  m_hdrLayer.position = CGPointMake((0.5 - source.origin.x) * full.width,
-                                    (0.5 - source.origin.y) * full.height);
-  m_hdrLayer.affineTransform = CGAffineTransformMakeRotation(frame.orientation * M_PI / 180.0);
+  const CGRect layerBounds = CGRectMake(0, 0, quarterTurn ? full.height : full.width,
+                                        quarterTurn ? full.width : full.height);
+  const CGPoint layerPosition = CGPointMake((0.5 - source.origin.x) * full.width,
+                                            (0.5 - source.origin.y) * full.height);
+  const CGAffineTransform layerTransform =
+      CGAffineTransformMakeRotation(frame.orientation * M_PI / 180.0);
+
+  // Decoded frames normally share their geometry. In particular, resetting a
+  // rotated canvas to identity and back for every frame invalidates UIKit/CA
+  // layout even when the final geometry is unchanged. Bounds and center can
+  // be updated directly while a transform is set; no intermediate reset is
+  // needed. Compare live properties so reparenting/PiP and scene changes are
+  // still reconciled, without a separate cache to invalidate.
+  if (m_hdrCanvas.superview == m_glView.superview &&
+      CGRectEqualToRect(m_hdrCanvas.bounds, canvasBounds) &&
+      CGPointEqualToPoint(m_hdrCanvas.center, canvasCenter) &&
+      CGAffineTransformEqualToTransform(m_hdrCanvas.transform, canvasTransform) &&
+      CGRectEqualToRect(m_hdrCrop.frame, cropFrame) &&
+      CGRectEqualToRect(m_hdrLayer.bounds, layerBounds) &&
+      CGPointEqualToPoint(m_hdrLayer.position, layerPosition) &&
+      CGAffineTransformEqualToTransform(m_hdrLayer.affineTransform, layerTransform))
+    return;
+
+  [CATransaction begin];
+  [CATransaction setDisableActions:YES];
+  if (m_hdrCanvas.superview != m_glView.superview)
+    [m_glView.superview insertSubview:m_hdrCanvas belowSubview:m_glView];
+  if (!CGRectEqualToRect(m_hdrCanvas.bounds, canvasBounds))
+    m_hdrCanvas.bounds = canvasBounds;
+  if (!CGPointEqualToPoint(m_hdrCanvas.center, canvasCenter))
+    m_hdrCanvas.center = canvasCenter;
+  if (!CGAffineTransformEqualToTransform(m_hdrCanvas.transform, canvasTransform))
+    m_hdrCanvas.transform = canvasTransform;
+  if (!CGRectEqualToRect(m_hdrCrop.frame, cropFrame))
+    m_hdrCrop.frame = cropFrame;
+  if (!CGRectEqualToRect(m_hdrLayer.bounds, layerBounds))
+    m_hdrLayer.bounds = layerBounds;
+  if (!CGPointEqualToPoint(m_hdrLayer.position, layerPosition))
+    m_hdrLayer.position = layerPosition;
+  if (!CGAffineTransformEqualToTransform(m_hdrLayer.affineTransform, layerTransform))
+    m_hdrLayer.affineTransform = layerTransform;
   [CATransaction commit];
 }
 
