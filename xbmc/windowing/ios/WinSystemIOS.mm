@@ -9,6 +9,7 @@
 #include "WinSystemIOS.h"
 
 #include "ServiceBroker.h"
+#include "cores/DataCacheCore.h"
 #include "VideoSyncIos.h"
 #include "WinEventsIOS.h"
 #include "cores/AudioEngine/Sinks/AESinkDARWINIOS.h"
@@ -23,6 +24,8 @@
 #include "filesystem/SpecialProtocol.h"
 #include "guilib/DispResource.h"
 #include "guilib/Texture.h"
+#include "guilib/GUIComponent.h"
+#include "guilib/GUIWindowManager.h"
 #include "messaging/ApplicationMessenger.h"
 #include "rendering/gles/ScreenshotSurfaceGLES.h"
 #include "settings/DisplaySettings.h"
@@ -462,6 +465,22 @@ void CWinSystemIOS::DeinitDisplayLink(void)
 void CWinSystemIOS::PresentRender(bool rendered, bool videoLayer)
 {
   const bool nativeVideo = IOSNativeVideoRenderingActive();
+  bool videoOnly = nativeVideo && !rendered && !IOSIsPictureInPictureActive() &&
+      GetGfxContext().IsFullScreenVideo() && !GetGfxContext().GetStereoMode() &&
+      !CServiceBroker::GetDataCacheCore().GetGuiRender() &&
+      !CServiceBroker::GetGUI()->GetWindowManager().HasVisibleControls();
+  // Optional finite A/B/A/B experiment in a single uninterrupted playback.
+  // Normal launches never take this path. After 90 seconds it stays enabled.
+  static const bool compareComposition = std::getenv("KODI_NATIVE_COMPOSITION_AB") != nullptr;
+  if (compareComposition && nativeVideo)
+  {
+    static const auto started = std::chrono::steady_clock::now();
+    const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::steady_clock::now() - started).count();
+    if (seconds < 30 || (seconds >= 60 && seconds < 90))
+      videoOnly = false;
+  }
+  IOSSetNativeVideoOnly(videoOnly);
   // With no GL swap there is no vsync wait. The generic idle delay is 40ms,
   // which would starve 50/60fps native playback; removing it without a paced
   // wait would instead busy-loop. Account for work already done this tick.

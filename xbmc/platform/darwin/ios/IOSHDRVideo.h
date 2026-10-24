@@ -60,6 +60,9 @@ void IOSEndHDRVideo(uint64_t session);
 bool IOSIsPictureInPictureActive();
 bool IOSNativeVideoRenderingActive();
 uint64_t IOSNativeVideoEnqueuedFrames();
+// Called on Kodi's render thread after processing controls/subtitles. UIKit
+// applies only transitions; touch delivery remains attached to the GL view.
+void IOSSetNativeVideoOnly(bool videoOnly);
 CVPixelBufferRef IOSCompositeVideo(CVPixelBufferRef video, const IOSSubtitleBitmap& subtitles);
 // Returns an owned, 10-bit BT.709 surface, or nullptr with a VideoToolbox error.
 // Calls must be serialised on the native-video delivery queue.

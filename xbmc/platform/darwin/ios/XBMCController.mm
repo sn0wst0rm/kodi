@@ -60,6 +60,7 @@
 
 #include <math.h>
 #include <algorithm>
+#include <cstdlib>
 #include <mutex>
 #include <atomic>
 #include <functional>
@@ -110,6 +111,7 @@ std::atomic_bool pipActive{false};
 std::atomic_bool hdrOutputEnabled{true};
 std::atomic_uint64_t hdrRangeGeneration{0};
 std::atomic_uint64_t nativeEnqueuedFrames{0};
+std::atomic_bool nativeVideoOnlyRequested{false};
 void ScheduleHDRDelivery(); // caller holds hdrMutex
 }
 
@@ -329,6 +331,7 @@ public:
   BOOL m_hdrFailed;
   CGSize m_hdrSceneSize;
   CGSize m_hdrCanvasSize;
+  BOOL m_hdrVideoOnly;
 }
 - (void)rescheduleNetworkAutoSuspend;
 - (void)updateFoldPlaybackState;
@@ -339,6 +342,7 @@ public:
 - (void)displayHDRFrame:(const std::shared_ptr<IOSHDRFrame>&)frame;
 - (void)layoutHDRVideo;
 - (void)resetHDRVideo;
+- (void)updateNativeVideoComposition;
 - (void)updatePictureInPictureState;
 @end
 
@@ -351,6 +355,15 @@ bool IOSNativeVideoRenderingActive()
 {
   std::lock_guard<std::mutex> lock(hdrMutex);
   return hdrActiveSession != 0;
+}
+
+void IOSSetNativeVideoOnly(bool videoOnly)
+{
+  if (nativeVideoOnlyRequested.exchange(videoOnly) == videoOnly)
+    return;
+  dispatch_async(dispatch_get_main_queue(), ^{
+    [g_xbmcController updateNativeVideoComposition];
+  });
 }
 
 namespace
@@ -465,6 +478,7 @@ void ScheduleHDRDelivery()
   if (@available(iOS 17.0, *))
     [m_hdrLayer.sampleBufferRenderer flushWithRemovalOfDisplayedImage:YES completionHandler:nil];
   m_hdrCanvas.hidden = YES;
+  [self updateNativeVideoComposition];
   m_hdrDisplayedFrame.reset();
   m_hdrEnqueuedFrame.reset();
   m_hdrPresentedSession = 0;
@@ -479,6 +493,38 @@ void ScheduleHDRDelivery()
     m_pipTimer = nil;
     m_foldPiP.enabled = NO;
   }
+}
+
+- (void)updateNativeVideoComposition
+{
+  if (!m_hdrCanvas || !m_glView.superview)
+    return;
+  const BOOL videoOnly = nativeVideoOnlyRequested.load() && !m_hdrCanvas.hidden &&
+      !IOSIsPictureInPictureActive();
+  if (m_hdrVideoOnly == videoOnly && m_hdrCanvas.superview == m_glView.superview)
+    return;
+  m_hdrVideoOnly = videoOnly;
+  [CATransaction begin];
+  [CATransaction setDisableActions:YES];
+  if (videoOnly)
+  {
+    // An opaque canvas above the retained GL surface lets the compositor
+    // occlude it, including the letterbox bars. Do not hide the GL UIView:
+    // its recognizers must still receive the tap that reveals the OSD.
+    m_hdrCanvas.backgroundColor = UIColor.blackColor;
+    m_hdrCanvas.opaque = YES;
+    [m_glView.superview insertSubview:m_hdrCanvas aboveSubview:m_glView];
+  }
+  else
+  {
+    m_hdrCanvas.backgroundColor = UIColor.clearColor;
+    m_hdrCanvas.opaque = NO;
+    [m_glView.superview insertSubview:m_hdrCanvas belowSubview:m_glView];
+  }
+  [CATransaction commit];
+  static const bool collectStats = std::getenv("KODI_NATIVE_RENDER_STATS") != nullptr;
+  if (collectStats)
+    CLog::Log(LOGINFO, "iOS native composition: video-only={}", bool(videoOnly));
 }
 
 - (void)layoutHDRVideo
@@ -549,7 +595,12 @@ void ScheduleHDRDelivery()
   [CATransaction begin];
   [CATransaction setDisableActions:YES];
   if (m_hdrCanvas.superview != m_glView.superview)
-    [m_glView.superview insertSubview:m_hdrCanvas belowSubview:m_glView];
+  {
+    if (m_hdrVideoOnly)
+      [m_glView.superview insertSubview:m_hdrCanvas aboveSubview:m_glView];
+    else
+      [m_glView.superview insertSubview:m_hdrCanvas belowSubview:m_glView];
+  }
   if (!CGRectEqualToRect(m_hdrCanvas.bounds, canvasBounds))
     m_hdrCanvas.bounds = canvasBounds;
   if (!CGPointEqualToPoint(m_hdrCanvas.center, canvasCenter))
@@ -693,6 +744,7 @@ void ScheduleHDRDelivery()
         CFRelease(sample);
         m_hdrEnqueuedFrame = frame;
         m_hdrCanvas.hidden = NO;
+      [self updateNativeVideoComposition];
         m_glView.opaque = NO;
         m_glView.layer.opaque = NO;
       }
