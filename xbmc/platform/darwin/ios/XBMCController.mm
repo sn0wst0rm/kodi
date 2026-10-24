@@ -109,6 +109,7 @@ bool hdrDeliveryScheduled{false};
 std::atomic_bool pipActive{false};
 std::atomic_bool hdrOutputEnabled{true};
 std::atomic_uint64_t hdrRangeGeneration{0};
+std::atomic_uint64_t nativeEnqueuedFrames{0};
 void ScheduleHDRDelivery(); // caller holds hdrMutex
 }
 
@@ -342,6 +343,10 @@ public:
 @end
 
 bool IOSIsPictureInPictureActive() { return pipActive.load(); }
+uint64_t IOSNativeVideoEnqueuedFrames()
+{
+  return nativeEnqueuedFrames.load(std::memory_order_relaxed);
+}
 bool IOSNativeVideoRenderingActive()
 {
   std::lock_guard<std::mutex> lock(hdrMutex);
@@ -684,6 +689,7 @@ void ScheduleHDRDelivery()
         CFDictionarySetValue((CFMutableDictionaryRef)CFArrayGetValueAtIndex(attachments, 0),
                              kCMSampleAttachmentKey_DisplayImmediately, kCFBooleanTrue);
         [renderer enqueueSampleBuffer:sample];
+        nativeEnqueuedFrames.fetch_add(1, std::memory_order_relaxed);
         CFRelease(sample);
         m_hdrEnqueuedFrame = frame;
         m_hdrCanvas.hidden = NO;

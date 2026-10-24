@@ -827,7 +827,11 @@ bool CRenderManager::IsGuiLayer()
     if (!m_pRenderer)
       return false;
 
-    if ((m_pRenderer->IsGuiLayer() && IsPresenting()) ||
+    // Native iOS frames are presented by FrameMove, independently of the GL
+    // surface. Only overlays/GUI changes need to invalidate that surface.
+    // Keep IsVideoLayer unchanged: RenderUpdate still computes the viewport
+    // and transparent video hole whenever the GUI actually renders.
+    if ((!m_nativeIOSRenderer && m_pRenderer->IsGuiLayer() && IsPresenting()) ||
         m_renderedOverlay || m_overlays.HasOverlay(m_presentsource))
       return true;
 

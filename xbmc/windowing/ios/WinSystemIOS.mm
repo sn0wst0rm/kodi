@@ -40,6 +40,10 @@
 #include <memory>
 #include <mutex>
 #include <vector>
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
+#include <thread>
 
 #import <Foundation/Foundation.h>
 #import <OpenGLES/ES2/gl.h>
@@ -454,6 +458,53 @@ void CWinSystemIOS::DeinitDisplayLink(void)
 }
 //------------DisplayLink stuff end
 //--------------------------------------------------------------
+
+void CWinSystemIOS::PresentRender(bool rendered, bool videoLayer)
+{
+  const bool nativeVideo = IOSNativeVideoRenderingActive();
+  // With no GL swap there is no vsync wait. The generic idle delay is 40ms,
+  // which would starve 50/60fps native playback; removing it without a paced
+  // wait would instead busy-loop. Account for work already done this tick.
+  if (!rendered && nativeVideo)
+  {
+    double fps = GetGfxContext().GetFPS();
+    if (!std::isfinite(fps))
+      fps = 60.0;
+    fps = std::clamp(fps, 60.0, 240.0);
+    const auto interval = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+        std::chrono::duration<double>(1.0 / fps));
+    std::this_thread::sleep_until(m_lastNativeFrameTick + interval);
+  }
+  CRenderSystemGLES::PresentRender(rendered, videoLayer || nativeVideo);
+  const auto now = std::chrono::steady_clock::now();
+  m_lastNativeFrameTick = now;
+
+  // Opt-in aggregate counters for on-device cadence/power investigations.
+  // No per-frame logs and no stream identifiers are recorded.
+  static const bool collectStats = std::getenv("KODI_NATIVE_RENDER_STATS") != nullptr;
+  if (collectStats && nativeVideo)
+  {
+    const auto frames = IOSNativeVideoEnqueuedFrames();
+    if (m_nativeStatsStart == std::chrono::steady_clock::time_point{})
+    {
+      m_nativeStatsStart = now;
+      m_nativeStatsFrames = frames;
+      m_nativeStatsTicks = m_nativeStatsGui = 0;
+    }
+    ++m_nativeStatsTicks;
+    m_nativeStatsGui += rendered;
+    const double seconds = std::chrono::duration<double>(now - m_nativeStatsStart).count();
+    if (seconds >= 10.0)
+    {
+      CLog::Log(LOGINFO, "iOS native cadence: video={:.2f} fps, GUI={:.2f} fps, loop={:.2f} Hz",
+                (frames - m_nativeStatsFrames) / seconds, m_nativeStatsGui / seconds,
+                m_nativeStatsTicks / seconds);
+      m_nativeStatsStart = {};
+    }
+  }
+  else
+    m_nativeStatsStart = {};
+}
 
 void CWinSystemIOS::PresentRenderImpl(bool rendered)
 {

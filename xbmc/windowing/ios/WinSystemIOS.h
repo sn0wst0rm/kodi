@@ -14,6 +14,7 @@
 
 #include <string>
 #include <vector>
+#include <chrono>
 
 #include <CoreVideo/CVOpenGLESTextureCache.h>
 
@@ -57,6 +58,7 @@ public:
 
   bool BeginRender() override;
   bool EndRender() override;
+  void PresentRender(bool rendered, bool videoLayer) override;
 
   void Register(IDispResource *resource) override;
   void Unregister(IDispResource *resource) override;
@@ -96,5 +98,10 @@ private:
   CADisplayLinkWrapper *m_pDisplayLink;
   int m_internalTouchscreenResolutionWidth = -1;
   int m_internalTouchscreenResolutionHeight = -1;
+  std::chrono::steady_clock::time_point m_lastNativeFrameTick{};
+  std::chrono::steady_clock::time_point m_nativeStatsStart{};
+  uint64_t m_nativeStatsFrames{0};
+  unsigned int m_nativeStatsTicks{0};
+  unsigned int m_nativeStatsGui{0};
 };
 

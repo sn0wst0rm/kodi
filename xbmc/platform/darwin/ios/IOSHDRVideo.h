@@ -59,6 +59,7 @@ void IOSPresentHDRVideo(uint64_t session, CVPixelBufferRef buffer,
 void IOSEndHDRVideo(uint64_t session);
 bool IOSIsPictureInPictureActive();
 bool IOSNativeVideoRenderingActive();
+uint64_t IOSNativeVideoEnqueuedFrames();
 CVPixelBufferRef IOSCompositeVideo(CVPixelBufferRef video, const IOSSubtitleBitmap& subtitles);
 // Returns an owned, 10-bit BT.709 surface, or nullptr with a VideoToolbox error.
 // Calls must be serialised on the native-video delivery queue.
