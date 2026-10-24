@@ -1,0 +1,54 @@
+{
+  "schema_version": 1,
+  "snapshot_date": "2026-10-24",
+  "kodi": {
+    "upstream_repository": "https://github.com/xbmc/xbmc.git",
+    "base_tag": "21.3-Omega",
+    "base_commit": "a3a448d26b8d560a65655dab2cd122994dc4e146",
+    "built_source_commit": "12309b123621f5d6e6346503a62c717e7d2285d3",
+    "built_source_tree": "708c79f70807d55ec86e49b8b4d0b2a698054b28",
+    "application_commits_since_base": 23,
+    "configuration": "Release",
+    "sdk": "iphoneos27.1",
+    "architecture": "arm64",
+    "deployment_target": "15.0"
+  },
+  "inputstream_adaptive": {
+    "repository": "https://github.com/xbmc/inputstream.adaptive.git",
+    "version": "21.5.18",
+    "base_tag": "21.5.18-Omega",
+    "base_commit": "d38987f739125917aeb47865ab364a73dae58909",
+    "built_source_commit": "dfd2e46d6ee58c814467da3698f557a566897c45",
+    "source_tree": "b2d6cc8c8079dd297f90d36d3bac73b454223c57",
+    "patches": [
+      {
+        "file": "inputstream-adaptive/0001-Expose-Auto-and-pinned-adaptive-video-qualities-for-.patch",
+        "sha256": "1a0f8e53172f560d1762802b881ded8ae72c6102aed4f7e0a7f4eb1095eca432"
+      },
+      {
+        "file": "inputstream-adaptive/0002-Use-Apple-CommonCrypto-for-Bento4-AES-CBC-and-CTR.patch",
+        "sha256": "01219a58940d58e3d2ca71176848f8253aae76fba742f0bc4d64130fcd4b684b"
+      }
+    ],
+    "cmake_options": {
+      "CMAKE_BUILD_TYPE": "Release",
+      "CMAKE_OSX_DEPLOYMENT_TARGET": "15.0",
+      "ENABLE_INTERNAL_BENTO4": "ON",
+      "ENABLE_KODI_DUO_QUALITY": "ON",
+      "BUILD_TESTING": "OFF"
+    },
+    "bento4_version": "1.6.0-641-3-Omega",
+    "pugixml_version": "1.13"
+  },
+  "iptv_simple": {
+    "version": "21.11.0",
+    "local_source_modifications": false
+  },
+  "local_installed_artifact": {
+    "version": "21.3",
+    "build": "20261024-rel-12309b1",
+    "sha256": "1f6fb6f2e2e0ea2597eb8908a1ae8ae0cf7cbb860569e3c34da88eb5a41eb0aa",
+    "published": false,
+    "note": "Provenance only; source reconstruction does not reproduce signing or identical IPA bytes."
+  }
+}

@@ -1,0 +1,127 @@
+From f40a47c9162875c2b45e3dce6b2202b249d72a35 Mon Sep 17 00:00:00 2001
+From: sn0wst0rm <9982041+sn0wst0rm@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 01:22:15 +0200
+Subject: [PATCH 1/2] Expose Auto and pinned adaptive video qualities for Kodi
+ Duo
+
+---
+ CMakeLists.txt                |  5 +++++
+ src/Session.cpp               | 19 +++++++++++++++++++
+ src/common/AdaptiveStream.cpp |  2 +-
+ src/common/AdaptiveStream.h   |  3 +++
+ src/common/Chooser.h          |  2 ++
+ src/common/ChooserDefault.h   |  1 +
+ 6 files changed, 31 insertions(+), 1 deletion(-)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index ff1f2ba8af03ac986760f8e781a493e3854e45df..062016bfb9a39cb7090bb65c4a1c0ec70c37907c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -7,6 +7,10 @@ project(inputstream.adaptive)
+ include(Helpers.cmake)
+ 
+ option(BUILD_TESTING "Build the testing tree." ON)
++option(ENABLE_KODI_DUO_QUALITY "Expose adaptive Auto and pinned video representations" OFF)
++if(ENABLE_KODI_DUO_QUALITY)
++  add_compile_definitions(KODI_DUO_QUALITY)
++endif()
+ set(CMAKE_MODULE_PATH ${CMAKE_MODULE_PATH} ${PROJECT_SOURCE_DIR})
+ set(CMAKE_FIND_FRAMEWORK LAST)
+ # Sets the default path where the CDM library is contained (affects the default value of the add-on settings)
+@@ -45,6 +49,7 @@ get_property(HEADERS_LIST GLOBAL PROPERTY GlobalHeaderList)
+ list(APPEND ADP_HEADERS ${HEADERS_LIST})
+ 
+ include_directories(${INCLUDES}
++                    ${PUGIXML_INCLUDE_DIRS}
+                     ${KODI_INCLUDE_DIR}/.. # Hack way with "/..", need bigger Kodi cmake rework to match right include ways (becomes done in future)
+                     src/
+ )
+diff --git a/src/Session.cpp b/src/Session.cpp
+index f2b0f1e2637ddff81a14c51ebf3b5be356adc2ab..c009139d960bf237fdcc3a64f6742e664e21de6c 100644
+--- a/src/Session.cpp
++++ b/src/Session.cpp
+@@ -672,6 +672,25 @@ bool CSession::InitializePeriod(bool isSessionOpened /* = false */)
+     // Get the default initial stream repr. based on "adaptive repr. chooser"
+     auto defaultRepr{m_reprChooser->GetRepresentation(adp)};
+ 
++#ifdef KODI_DUO_QUALITY
++    if (adp->GetStreamType() == StreamType::VIDEO &&
++        m_reprChooser->SupportsAutoManualSelection() && adp->GetRepresentations().size() > 1)
++    {
++      // Auto remains the default and keeps the bandwidth-based chooser. Each
++      // additional logical video stream pins one manifest representation; Kodi
++      // switches them through its existing stream-change/seek machinery.
++      AddStream(adp, defaultRepr, true, adpIndex, audioLanguageOrig);
++      m_streams.back()->m_info.SetName("Auto");
++      for (size_t i = 0; i < adp->GetRepresentations().size(); ++i)
++      {
++        auto* rep = adp->GetRepresentations()[i].get();
++        const uint32_t uniqueId = adpIndex | ((adp->GetRepresentations().size() - i) << 16);
++        AddStream(adp, rep, false, uniqueId, audioLanguageOrig);
++        m_streams.back()->m_adStream.SetFixedRepresentation(true);
++      }
++    }
++    else
++#endif
+     if (isManualStreamSelection)
+     {
+       // Add all stream representations
+diff --git a/src/common/AdaptiveStream.cpp b/src/common/AdaptiveStream.cpp
+index e083756dcad0d9a03462d90de19817878889c926..9ec4cd58910249f8439b16397145a914154661fa 100644
+--- a/src/common/AdaptiveStream.cpp
++++ b/src/common/AdaptiveStream.cpp
+@@ -916,7 +916,7 @@ bool AdaptiveStream::ensureSegment()
+         // 
+         //! @todo: isLastSegment could be inconsistent if InsertLiveSegment is used
+         //! must be done a real check to verify if the segment is the last of period
+-        if (isLastSegment)
++        if (isLastSegment || m_fixedRepresentation)
+           newRep = prevRep;
+         else
+           newRep = m_tree->GetRepChooser()->GetNextRepresentation(current_adp_, prevRep);
+diff --git a/src/common/AdaptiveStream.h b/src/common/AdaptiveStream.h
+index 88cbf29af4fc84547975173fceb72519f13a9da1..e147a8b799096ec8fcfe0217677d93411d53e333 100644
+--- a/src/common/AdaptiveStream.h
++++ b/src/common/AdaptiveStream.h
+@@ -119,6 +119,8 @@ enum class EVENT_TYPE
+     PLAYLIST::CPeriod* getPeriod() { return current_period_; };
+     PLAYLIST::CAdaptationSet* getAdaptationSet() { return current_adp_; };
+     PLAYLIST::CRepresentation* getRepresentation() { return current_rep_; };
++    // Set before stream download starts. Manual variants keep their representation.
++    void SetFixedRepresentation(bool fixed) { m_fixedRepresentation = fixed; }
+     size_t getSegmentPos();
+     uint64_t GetCurrentPTSOffset() { return currentPTSOffset_; };
+     uint64_t GetAbsolutePTSOffset() { return absolutePTSOffset_; };
+@@ -265,6 +267,7 @@ enum class EVENT_TYPE
+     AdaptiveStreamObserver *observer_;
+     // Active configuration
+     PLAYLIST::CPeriod* current_period_;
++    bool m_fixedRepresentation{false};
+     PLAYLIST::CAdaptationSet* current_adp_;
+     PLAYLIST::CRepresentation* current_rep_;
+     PLAYLIST::CRepresentation* m_switchRep{nullptr};
+diff --git a/src/common/Chooser.h b/src/common/Chooser.h
+index 57c91d73d3c0d0fe506e50f050643c1cf3653bf7..0d8531daf5cc0ae0c9308ef1708adb1cb34d1bfe 100644
+--- a/src/common/Chooser.h
++++ b/src/common/Chooser.h
+@@ -85,6 +85,8 @@ public:
+    *        in playback.
+    * \return The stream selection mode
+    */
++  virtual bool SupportsAutoManualSelection() const { return false; }
++
+   virtual StreamSelection GetStreamSelectionMode() { return StreamSelection::AUTO; }
+ 
+   /*!
+diff --git a/src/common/ChooserDefault.h b/src/common/ChooserDefault.h
+index ff09e0372f66a9bc8b7545d231bfb8db76cdfd58..198a2812675ffa41d318b585b5639005204e2f4b 100644
+--- a/src/common/ChooserDefault.h
++++ b/src/common/ChooserDefault.h
+@@ -32,6 +32,7 @@ public:
+   virtual void PostInit() override;
+ 
+   void SetDownloadSpeed(const double speed) override;
++  bool SupportsAutoManualSelection() const override { return true; }
+ 
+   PLAYLIST::CRepresentation* GetNextRepresentation(PLAYLIST::CAdaptationSet* adp,
+                                                    PLAYLIST::CRepresentation* currentRep) override;
