@@ -253,6 +253,14 @@ void CVideoPlayerAudio::Process()
     if (m_paused)
       priority = 1;
 
+    // Once paused or waiting for sync, the sink can drain to an empty cache.
+    // A zero timeout then polls only the priority queue forever: the timeout
+    // branch below continues before its normal stall sleep. Wait on the queue
+    // event instead, which still wakes immediately for resume/flush/stop.
+    // Keep the deliberate nonblocking decoder-drain probe below unchanged.
+    if (priority && timeout < 10ms)
+      timeout = 10ms;
+
     if (onlyPrioMsgs)
     {
       priority = 1;
