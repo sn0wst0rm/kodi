@@ -25,6 +25,7 @@
 #include "utils/log.h"
 
 #include <cassert>
+#include <cerrno>
 #include <map>
 #include <mutex>
 #include <queue>
@@ -172,6 +173,22 @@ void CEventServer::Run()
         if ((packetSize = m_pSocket->Read(addr, PACKET_SIZE, m_pPacketBuffer.data())) > -1)
         {
           ProcessPacket(addr, packetSize);
+        }
+        else
+        {
+#ifdef TARGET_WINDOWS
+          const int error = WSAGetLastError();
+          const bool retry = error == WSAEINTR || error == WSAEWOULDBLOCK;
+#else
+          const int error = errno;
+          const bool retry = error == EINTR || error == EAGAIN || error == EWOULDBLOCK;
+#endif
+          if (!retry)
+          {
+            // A revoked socket remains readable; the outer loop recreates it.
+            CLog::Log(LOGWARNING, "ES: UDP receive failed ({}); restarting listener", error);
+            break;
+          }
         }
       }
     }

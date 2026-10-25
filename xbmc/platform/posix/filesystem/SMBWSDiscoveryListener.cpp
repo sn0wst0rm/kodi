@@ -186,12 +186,18 @@ void CWSDiscoveryListenerUDP::Start()
 
 void CWSDiscoveryListenerUDP::Process()
 {
+  while (!m_bStop && Run())
+    CThread::Sleep(std::chrono::seconds(1));
+}
+
+bool CWSDiscoveryListenerUDP::Run()
+{
   fd = socket(AF_INET, SOCK_DGRAM, 0);
   if (fd < 0)
   {
     CLog::Log(LOGDEBUG, LOGWSDISCOVERY,
               "CWSDiscoveryListenerUDP::Process - Socket Creation failed");
-    return;
+    return false;
   }
 
   // set socket reuse
@@ -200,7 +206,7 @@ void CWSDiscoveryListenerUDP::Process()
   {
     CLog::Log(LOGDEBUG, LOGWSDISCOVERY, "CWSDiscoveryListenerUDP::Process - Reuse Option failed");
     Cleanup(true);
-    return;
+    return false;
   }
 
   // set up destination address
@@ -215,7 +221,7 @@ void CWSDiscoveryListenerUDP::Process()
   {
     CLog::Log(LOGDEBUG, LOGWSDISCOVERY, "CWSDiscoveryListenerUDP::Process - Bind failed");
     Cleanup(true);
-    return;
+    return false;
   }
 
   // use setsockopt() to request join a multicast group on all interfaces
@@ -228,7 +234,7 @@ void CWSDiscoveryListenerUDP::Process()
     CLog::Log(LOGDEBUG, LOGWSDISCOVERY,
               "CWSDiscoveryListenerUDP::Process - Multicast Option failed");
     Cleanup(true);
-    return;
+    return false;
   }
 
   // Disable receiving broadcast messages on loopback
@@ -239,15 +245,13 @@ void CWSDiscoveryListenerUDP::Process()
     CLog::Log(LOGDEBUG, LOGWSDISCOVERY,
               "CWSDiscoveryListenerUDP::Process - Loopback Disable Option failed");
     Cleanup(true);
-    return;
+    return false;
   }
 
   std::string bufferoutput;
   fd_set rset;
   int nready;
   struct timeval timeout;
-
-  FD_ZERO(&rset);
 
   // Send HELLO to the world
   AddCommand(WSD_ACT_HELLO);
@@ -258,13 +262,19 @@ void CWSDiscoveryListenerUDP::Process()
 
   while (!m_bStop)
   {
+    FD_ZERO(&rset);
     FD_SET(fd, &rset);
     timeout.tv_sec = 3;
     timeout.tv_usec = 0;
     nready = select((fd + 1), &rset, NULL, NULL, &timeout);
 
     if (nready < 0)
+    {
+      if (errno == EINTR)
+        continue;
+      CLog::Log(LOGWARNING, "WS-Discovery UDP select failed ({}); restarting listener", errno);
       break;
+    }
 
     if (m_bStop)
       break;
@@ -276,7 +286,15 @@ void CWSDiscoveryListenerUDP::Process()
       char msgbuf[UDPBUFFSIZE];
       socklen_t addrlen = sizeof(addr);
       int nbytes = recvfrom(fd, msgbuf, UDPBUFFSIZE - 1, 0, (struct sockaddr*)&addr, &addrlen);
-      if (nbytes <= 0)
+      if (nbytes < 0)
+      {
+        const int error = errno;
+        if (error == EINTR || error == EAGAIN || error == EWOULDBLOCK)
+          continue;
+        CLog::Log(LOGWARNING, "WS-Discovery UDP receive failed ({}); restarting listener", error);
+        break;
+      }
+      if (nbytes == 0)
         continue;
       msgbuf[nbytes] = '\0';
       // turn msgbuf into std::string
@@ -294,7 +312,7 @@ void CWSDiscoveryListenerUDP::Process()
   AddCommand(WSD_ACT_BYE);
   DispatchCommand();
   Cleanup(false);
-  return;
+  return !m_bStop;
 }
 
 void CWSDiscoveryListenerUDP::Cleanup(bool aborted)

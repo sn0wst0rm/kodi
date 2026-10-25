@@ -37,6 +37,8 @@ protected:
   void Process() override;
 
 private:
+  bool Run();
+
   struct Command
   {
     struct sockaddr_in address;
