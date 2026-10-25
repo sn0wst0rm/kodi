@@ -51,6 +51,9 @@ public:
   CURLMcode multi_add_handle(CURLM* multi_handle, CURL_HANDLE* easy_handle);
   CURLMcode multi_perform(CURLM* multi_handle, int* running_handles);
   CURLMcode multi_remove_handle(CURLM* multi_handle, CURL_HANDLE* easy_handle);
+#if LIBCURL_VERSION_NUM >= 0x074200 // 7.66.0
+  CURLMcode multi_poll(CURLM* multi_handle, int timeout_ms);
+#endif
   CURLMcode multi_fdset(CURLM* multi_handle,
                         fd_set* read_fd_set,
                         fd_set* write_fd_set,

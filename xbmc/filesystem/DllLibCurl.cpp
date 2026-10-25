@@ -76,6 +76,13 @@ CURLMcode DllLibCurl::multi_remove_handle(CURLM* multi_handle, CURL_HANDLE* easy
   return curl_multi_remove_handle(multi_handle, easy_handle);
 }
 
+#if LIBCURL_VERSION_NUM >= 0x074200 // 7.66.0
+CURLMcode DllLibCurl::multi_poll(CURLM* multi_handle, int timeout_ms)
+{
+  return curl_multi_poll(multi_handle, nullptr, 0, timeout_ms, nullptr);
+}
+#endif
+
 CURLMcode DllLibCurl::multi_fdset(
     CURLM* multi_handle, fd_set* read_fd_set, fd_set* write_fd_set, fd_set* exc_fd_set, int* max_fd)
 {

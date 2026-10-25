@@ -1741,9 +1741,11 @@ ssize_t CCurlFile::CReadState::Read(void* lpBuf, size_t uiBufSize)
 int8_t CCurlFile::CReadState::FillBuffer(unsigned int want)
 {
   int retry = 0;
+#if LIBCURL_VERSION_NUM < 0x074200 // 7.66.0
   fd_set fdread;
   fd_set fdwrite;
   fd_set fdexcep;
+#endif
 
   // only attempt to fill buffer if transactions still running and buffer
   // doesn't exceed required size already
@@ -1878,6 +1880,20 @@ int8_t CCurlFile::CReadState::FillBuffer(unsigned int want)
     {
       case CURLM_OK:
       {
+        if (m_buffer.getMaxReadSize() >= want || m_buffer.getMaxWriteSize() == 0)
+          return FILLBUFFER_OK;
+
+#if LIBCURL_VERSION_NUM >= 0x074200 // 7.66.0
+        // libcurl also consumes resolver wakeups; select alone leaves them readable.
+        // Bound the wait so cancellation remains responsive.
+        const CURLMcode waitResult = g_curlInterface.multi_poll(m_multiHandle, 200);
+        if (waitResult != CURLM_OK)
+        {
+          CLog::Log(LOGERROR, "CCurlFile::CReadState::{} - ({}) Multi poll failed with code {}",
+                    __FUNCTION__, fmt::ptr(this), waitResult);
+          return FILLBUFFER_FAIL;
+        }
+#else
         int maxfd = -1;
         FD_ZERO(&fdread);
         FD_ZERO(&fdwrite);
@@ -1943,6 +1959,7 @@ int8_t CCurlFile::CReadState::FillBuffer(unsigned int want)
 
           return FILLBUFFER_FAIL;
         }
+#endif
       }
       break;
       case CURLM_CALL_MULTI_PERFORM:
