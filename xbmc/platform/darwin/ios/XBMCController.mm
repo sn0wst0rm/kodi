@@ -376,13 +376,13 @@ void FillVideoMetadata(const IOSHDRFrame& frame)
              CVTransferFunctionGetStringForIntegerCodePoint(metadata.transfer));
   setMissing(kCVImageBufferYCbCrMatrixKey,
              CVYCbCrMatrixGetStringForIntegerCodePoint(metadata.matrix));
-  if (metadata.hasMastering)
+  if (metadata.hasMastering && !CVBufferHasAttachment(pixel, kCVImageBufferMasteringDisplayColorVolumeKey))
   {
     CFDataRef data = CFDataCreate(nullptr, metadata.mastering.data(), metadata.mastering.size());
     setMissing(kCVImageBufferMasteringDisplayColorVolumeKey, data);
     CFRelease(data);
   }
-  if (metadata.hasLight)
+  if (metadata.hasLight && !CVBufferHasAttachment(pixel, kCVImageBufferContentLightLevelInfoKey))
   {
     CFDataRef data = CFDataCreate(nullptr, metadata.light.data(), metadata.light.size());
     setMissing(kCVImageBufferContentLightLevelInfoKey, data);
@@ -395,21 +395,36 @@ void ScheduleHDRDelivery()
   if (hdrDeliveryScheduled)
     return;
   hdrDeliveryScheduled = true;
+  const auto frame = std::move(hdrPendingFrame);
+  if (frame)
+    frame->rangeGeneration = hdrRangeGeneration.load();
+  const bool toneMap = frame && !hdrOutputEnabled.load() && IOSIsTenBitVideo(frame->sourceBuffer) &&
+      (frame->metadata.transfer == 16 || frame->metadata.transfer == 18);
+  const bool composite = frame && frame->subtitles && IOSIsPictureInPictureActive();
+  const bool processPixels = toneMap || composite;
+  dispatch_block_t deliver = ^{
+    bool current;
+    {
+      std::lock_guard<std::mutex> lock(hdrMutex);
+      current = frame && frame->session == hdrActiveSession &&
+          frame->rangeGeneration == hdrRangeGeneration.load();
+      hdrDeliveryScheduled = false;
+      if (hdrPendingFrame) ScheduleHDRDelivery();
+    }
+    if (current)
+      [g_xbmcController displayHDRFrame:frame];
+    else if (!IOSNativeVideoRenderingActive())
+      [g_xbmcController resetHDRVideo];
+  };
+  // Shared decoder surfaces need no worker hop. Pixel processing stays off UIKit.
   static dispatch_queue_t deliveryQueue = dispatch_queue_create("org.kodi.native-video", DISPATCH_QUEUE_SERIAL);
-  dispatch_async(deliveryQueue, ^{
+  dispatch_async(processPixels ? deliveryQueue : dispatch_get_main_queue(), ^{
     @autoreleasepool
     {
-      std::shared_ptr<IOSHDRFrame> frame;
-      {
-        std::lock_guard<std::mutex> lock(hdrMutex);
-        frame = std::move(hdrPendingFrame);
-      }
       if (frame)
       {
-        frame->rangeGeneration = hdrRangeGeneration.load();
         FillVideoMetadata(*frame);
-        if (!hdrOutputEnabled.load() && IOSIsTenBitVideo(frame->sourceBuffer) &&
-            (frame->metadata.transfer == 16 || frame->metadata.transfer == 18))
+        if (toneMap)
         {
           CVPixelBufferRef sdr = IOSConvertVideoToSDR(frame->buffer, &frame->conversionError);
           if (sdr)
@@ -420,7 +435,7 @@ void ScheduleHDRDelivery()
           }
         }
       }
-      if (frame && frame->subtitles && IOSIsPictureInPictureActive())
+      if (composite)
       {
         CVPixelBufferRef composited = IOSCompositeVideo(frame->buffer, *frame->subtitles);
         if (composited)
@@ -429,20 +444,10 @@ void ScheduleHDRDelivery()
           frame->buffer = composited;
         }
       }
-      dispatch_async(dispatch_get_main_queue(), ^{
-        bool current;
-        {
-          std::lock_guard<std::mutex> lock(hdrMutex);
-          current = frame && frame->session == hdrActiveSession &&
-              frame->rangeGeneration == hdrRangeGeneration.load();
-          hdrDeliveryScheduled = false;
-          if (hdrPendingFrame) ScheduleHDRDelivery();
-        }
-        if (current)
-          [g_xbmcController displayHDRFrame:frame];
-        else if (!IOSNativeVideoRenderingActive())
-          [g_xbmcController resetHDRVideo];
-      });
+      if (processPixels)
+        dispatch_async(dispatch_get_main_queue(), deliver);
+      else
+        deliver();
     }
   });
 }
